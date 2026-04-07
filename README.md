@@ -18,6 +18,17 @@ Inspired in part by Armin Ronacher's `agent-stuff` repository:
 pi install ~/code/agent-stuff
 ```
 
+## Included extensions
+
+### `extensions/powershell.ts`
+
+Adds a `powershell` tool for:
+
+- running PowerShell commands via `pwsh`
+- Windows-oriented shell workflows inside pi
+- cross-platform PowerShell Core usage on macOS, Linux, and Windows
+- automatically preferring PowerShell over `bash` on Windows
+
 ## Included skills
 
 ### `skills/cdp-browser`
@@ -25,7 +36,6 @@ pi install ~/code/agent-stuff
 Provides a CDP-powered browser skill for:
 
 - inspired by ideas from Armin Ronacher's `agent-stuff` CDP/web-browser skill
-
 - web search through a real Chromium browser session
 - fetching rendered page contents
 - handling JavaScript-dependent pages via Chrome DevTools Protocol
