@@ -12,10 +12,82 @@ Inspired in part by Armin Ronacher's `agent-stuff` repository:
 - `prompts/` — Reusable prompt templates (`.md` files, expand with `/name` in pi)
 - `themes/` — Custom themes (`.json` files)
 
-## Setup
+## Quick start
+
+If you already have this repo locally, install it into pi with:
 
 ```bash
 pi install ~/code/agent-stuff
+```
+
+You can also install from the current directory:
+
+```bash
+pi install .
+```
+
+Then reload pi:
+
+```bash
+/reload
+```
+
+## Detailed setup
+
+Clone and install:
+
+```bash
+git clone https://github.com/curtisalexander/agent-stuff.git
+cd agent-stuff
+pi install .
+```
+
+### Extra dependencies and considerations
+
+#### PowerShell extension
+
+The PowerShell extension requires PowerShell Core to be installed and available as `pwsh`.
+
+Check it with:
+
+```bash
+pwsh -NoLogo -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+```
+
+You can override the binary path with:
+
+```bash
+export POWERSHELL_BIN=/path/to/pwsh
+```
+
+#### CDP browser skill
+
+The CDP browser skill has a local Node dependency.
+Install it once after cloning:
+
+```bash
+cd skills/cdp-browser
+npm install
+cd ../..
+```
+
+It also requires a Chromium-based browser with remote debugging enabled.
+The easiest way is:
+
+```bash
+node skills/cdp-browser/scripts/start.js
+```
+
+You can then verify CDP is available with:
+
+```bash
+curl http://127.0.0.1:9222/json/version
+```
+
+After installing dependencies, reload pi if needed:
+
+```bash
+/reload
 ```
 
 ## Included extensions
