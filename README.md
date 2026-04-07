@@ -2,6 +2,9 @@
 
 Personal pi coding agent customizations.
 
+Inspired in part by Armin Ronacher's `agent-stuff` repository:
+- https://github.com/mitsuhiko/agent-stuff
+
 ## Structure
 
 - `extensions/` — TypeScript extensions (custom tools, commands, UI, event handlers)
@@ -20,6 +23,8 @@ pi install ~/code/agent-stuff
 ### `skills/cdp-browser`
 
 Provides a CDP-powered browser skill for:
+
+- inspired by ideas from Armin Ronacher's `agent-stuff` CDP/web-browser skill
 
 - web search through a real Chromium browser session
 - fetching rendered page contents
