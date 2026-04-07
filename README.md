@@ -14,3 +14,13 @@ Personal pi coding agent customizations.
 ```bash
 pi install ~/code/agent-stuff
 ```
+
+## Included skills
+
+### `skills/cdp-browser`
+
+Provides a CDP-powered browser skill for:
+
+- web search through a real Chromium browser session
+- fetching rendered page contents
+- handling JavaScript-dependent pages via Chrome DevTools Protocol

@@ -1,0 +1,8 @@
+{
+  "name": "cdp-browser-skill",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
