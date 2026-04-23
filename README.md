@@ -94,12 +94,20 @@ After installing dependencies, reload pi if needed:
 
 ### `extensions/powershell.ts`
 
-Adds a `powershell` tool for:
+Adds a `powershell` tool plus a set of background-job tools (`pwsh-start-job`,
+`pwsh-get-job`, `pwsh-stop-job`, `pwsh-remove-job`, `pwsh-get-job-output`) for:
 
-- running PowerShell commands via `pwsh`
+- running PowerShell commands via `pwsh`, with forced UTF-8 output
 - Windows-oriented shell workflows inside pi
+- automatic `.cmd`/`.bat` retry via `cmd.exe /c` when pwsh fails on Windows
+- background processes (dev servers, watchers) that survive across tool calls
+- streaming partial output to the TUI as commands run
 - cross-platform PowerShell Core usage on macOS, Linux, and Windows
 - automatically preferring PowerShell over `bash` on Windows
+
+The job-tool API shape is adapted from
+[`@marcfargas/pi-powershell`](https://github.com/marcfargas/pi-powershell) (MIT).
+Implementation is Node-native rather than PowerShell's `Start-Process`.
 
 ## Included skills
 
