@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent Stuff: A Field Guide to Extending pi</title>
+  <meta name="description" content="A practical guide to this agent-stuff repository, pi packages, extensions, skills, prompt templates, themes, and integration points." />
+  <style>
+    :root {
+      --bg: #0c1020;
+      --bg2: #121833;
+      --card: rgba(255,255,255,.075);
+      --card2: rgba(255,255,255,.105);
+      --text: #eef4ff;
+      --muted: #aab8d8;
+      --line: rgba(255,255,255,.16);
+      --blue: #65d6ff;
+      --purple: #b88cff;
+      --green: #62f2b3;
+      --yellow: #ffd166;
+      --red: #ff7b9c;
+      --shadow: 0 24px 80px rgba(0,0,0,.35);
+      --radius: 22px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(circle at 18% -10%, rgba(101,214,255,.32), transparent 35%),
+        radial-gradient(circle at 85% 8%, rgba(184,140,255,.32), transparent 32%),
+        linear-gradient(145deg, var(--bg), #080a14 60%, #090d1b);
+      line-height: 1.55;
+    }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, pre { font-family: var(--mono); }
+    code { color: #dbeafe; background: rgba(255,255,255,.09); padding: .12rem .34rem; border-radius: .45rem; }
+    pre { margin: 0; overflow-x: auto; padding: 1rem; background: rgba(0,0,0,.32); border: 1px solid var(--line); border-radius: 16px; }
+    .shell::before { content: "$ "; color: var(--green); }
+    .wrap { width: min(1180px, calc(100% - 32px)); margin: 0 auto; }
+    .hero { padding: 72px 0 38px; position: relative; }
+    .badge { display: inline-flex; gap: .5rem; align-items: center; padding: .45rem .75rem; border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,.06); color: var(--muted); font-size: .92rem; }
+    .badge b { color: var(--green); }
+    h1 { margin: 22px 0 14px; font-size: clamp(2.5rem, 7vw, 5.4rem); line-height: .92; letter-spacing: -.07em; max-width: 920px; }
+    .lead { max-width: 840px; color: #c8d4f4; font-size: clamp(1.1rem, 2vw, 1.35rem); }
+    .hero-grid { display: grid; grid-template-columns: 1.45fr .9fr; gap: 22px; align-items: stretch; margin-top: 34px; }
+    .panel, .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); backdrop-filter: blur(18px); }
+    .panel { padding: 24px; }
+    .toc { position: sticky; top: 16px; padding: 20px; }
+    .toc h2 { margin-top: 0; font-size: 1rem; color: #fff; }
+    .toc a { display: block; padding: .42rem 0; color: var(--muted); }
+    .toc a:hover { color: var(--text); }
+    .quick { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 20px; }
+    .pill { border: 1px solid var(--line); border-radius: 18px; padding: 15px; background: rgba(255,255,255,.055); }
+    .pill strong { display: block; color: #fff; margin-bottom: 4px; }
+    section { padding: 40px 0; }
+    h2 { font-size: clamp(1.9rem, 3vw, 3rem); line-height: 1; letter-spacing: -.045em; margin: 0 0 18px; }
+    h3 { font-size: 1.22rem; margin: 24px 0 9px; }
+    .muted { color: var(--muted); }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 18px; }
+    .span-4 { grid-column: span 4; } .span-5 { grid-column: span 5; } .span-6 { grid-column: span 6; } .span-7 { grid-column: span 7; } .span-8 { grid-column: span 8; } .span-12 { grid-column: span 12; }
+    .card { padding: 22px; }
+    .card h3:first-child { margin-top: 0; }
+    .tag { display: inline-block; padding: .22rem .55rem; margin: 0 .3rem .3rem 0; border-radius: 999px; font-size: .82rem; background: rgba(101,214,255,.12); color: #c8f2ff; border: 1px solid rgba(101,214,255,.22); }
+    .tag.green { background: rgba(98,242,179,.12); color: #cafce8; border-color: rgba(98,242,179,.24); }
+    .tag.purple { background: rgba(184,140,255,.13); color: #eadcff; border-color: rgba(184,140,255,.28); }
+    .tag.yellow { background: rgba(255,209,102,.12); color: #ffe8aa; border-color: rgba(255,209,102,.24); }
+    .tag.red { background: rgba(255,123,156,.12); color: #ffd4df; border-color: rgba(255,123,156,.24); }
+    table { width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 16px; }
+    th, td { padding: 13px 14px; vertical-align: top; border-bottom: 1px solid var(--line); }
+    th { color: #fff; text-align: left; background: rgba(255,255,255,.08); }
+    td { color: #cdd8f5; background: rgba(255,255,255,.035); }
+    tr:last-child td { border-bottom: 0; }
+    .flow { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .node { padding: .65rem .8rem; border-radius: 14px; border: 1px solid var(--line); background: rgba(255,255,255,.07); color: #f6f9ff; }
+    .arrow { color: var(--muted); }
+    .callout { border-left: 4px solid var(--blue); background: rgba(101,214,255,.08); padding: 16px 18px; border-radius: 14px; }
+    .callout.warn { border-color: var(--yellow); background: rgba(255,209,102,.08); }
+    .callout.danger { border-color: var(--red); background: rgba(255,123,156,.08); }
+    .repo-tree { white-space: pre; font-family: var(--mono); color: #d9e5ff; font-size: .92rem; }
+    .footer { color: var(--muted); padding: 44px 0 70px; border-top: 1px solid var(--line); margin-top: 30px; }
+    @media (max-width: 900px) { .hero-grid, .quick { grid-template-columns: 1fr; } .toc { position: static; } .span-4,.span-5,.span-6,.span-7,.span-8 { grid-column: span 12; } }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="wrap">
+      <span class="badge"><b>agent-stuff</b> cloneable pi customization package</span>
+      <h1>A field guide to extending pi without forking it.</h1>
+      <p class="lead">This guide explains what lives in this repository, how pi discovers it, and which hook to choose when you want to add tools, workflows, prompts, visual polish, or deeper runtime behavior.</p>
+      <div class="hero-grid">
+        <div class="panel">
+          <h2 style="font-size:1.8rem">The big idea</h2>
+          <p>Pi is a small terminal coding-agent harness. Instead of baking every workflow into core, it loads <strong>resources</strong> from your machine, a project, or a package like this repo:</p>
+          <div class="flow" aria-label="Pi package flow">
+            <span class="node">package.json <code>pi</code> manifest</span><span class="arrow">→</span>
+            <span class="node">extensions</span><span class="node">skills</span><span class="node">prompts</span><span class="node">themes</span><span class="arrow">→</span>
+            <span class="node">pi startup / <code>/reload</code></span>
+          </div>
+          <div class="quick">
+            <div class="pill"><strong>Extensions</strong><span class="muted">TypeScript code. Add tools, commands, UI, events, providers.</span></div>
+            <div class="pill"><strong>Skills</strong><span class="muted">Markdown instructions plus scripts. Loaded on demand.</span></div>
+            <div class="pill"><strong>Packages</strong><span class="muted">The distribution wrapper that makes a repo installable.</span></div>
+          </div>
+        </div>
+        <nav class="toc panel" aria-label="Contents">
+          <h2>Contents</h2>
+          <a href="#install">Install this repo</a>
+          <a href="#map">Repository map</a>
+          <a href="#concepts">Concepts and decision guide</a>
+          <a href="#lifecycle">How pi hooks together</a>
+          <a href="#extensions">Extension superpowers</a>
+          <a href="#skills">Skills and prompts</a>
+          <a href="#current">Current customizations</a>
+          <a href="#patterns">Patterns from Mitsuhiko's repo</a>
+          <a href="#next">Where to put your ideas</a>
+        </nav>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section id="install">
+      <h2>Install this repo into pi</h2>
+      <div class="grid">
+        <div class="card span-7">
+          <p>Because this repository has a <code>package.json</code> with <code>keywords: ["pi-package"]</code> and a <code>pi</code> manifest, pi can install it directly from a local checkout or from git.</p>
+          <pre><code><span class="shell"></span>git clone https://github.com/curtisalexander/agent-stuff.git
+<span class="shell"></span>cd agent-stuff
+<span class="shell"></span>pi install .
+# then inside pi:
+/reload</code></pre>
+        </div>
+        <div class="card span-5">
+          <h3>What pi reads from this package</h3>
+          <pre><code>{
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"],
+    "themes": ["./themes"]
+  }
+}</code></pre>
+          <p class="muted">If the manifest were absent, pi would still auto-discover these conventional directories.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="map">
+      <h2>Repository map</h2>
+      <div class="grid">
+        <div class="card span-6">
+          <div class="repo-tree">agent-stuff/
+├── package.json          pi package manifest
+├── README.md             quick setup and inventory
+├── extensions/
+│   └── powershell.ts     custom tools and Windows behavior
+├── skills/
+│   └── cdp-browser/
+│       ├── SKILL.md      on-demand browser instructions
+│       ├── package.json  local ws dependency
+│       └── scripts/      CDP helper commands
+├── prompts/              reusable slash prompt templates
+└── themes/               terminal UI theme JSON files</div>
+        </div>
+        <div class="card span-6">
+          <h3>What is currently populated?</h3>
+          <ul>
+            <li><strong>One extension:</strong> <code>extensions/powershell.ts</code>.</li>
+            <li><strong>One skill:</strong> <code>skills/cdp-browser</code>, with JavaScript helper scripts.</li>
+            <li><strong>Empty conventional directories:</strong> <code>prompts/</code> and <code>themes/</code> are ready for future resources.</li>
+          </ul>
+          <p class="muted">This is already a valid pi package. It is a small starting point, not a random scripts folder.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="concepts">
+      <h2>Same or different? A decision guide</h2>
+      <div class="card">
+        <table>
+          <thead><tr><th>Thing</th><th>What it is</th><th>Loaded into prompt?</th><th>Can run code?</th><th>Use when...</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Context files</strong><br><code>AGENTS.md</code></td><td>Always-on project/user instructions.</td><td>Yes, at startup.</td><td>No.</td><td>You want standing conventions: test commands, coding style, repo rules.</td></tr>
+            <tr><td><strong>Prompt templates</strong><br><code>prompts/*.md</code></td><td>Reusable slash commands such as <code>/review</code>.</td><td>Only when invoked.</td><td>No.</td><td>You repeat a prompt pattern and want arguments like <code>$1</code> or <code>$@</code>.</td></tr>
+            <tr><td><strong>Skills</strong><br><code>SKILL.md</code></td><td>On-demand capability docs with optional scripts/assets.</td><td>Description is listed; full file is read when needed or via <code>/skill:name</code>.</td><td>Indirectly: scripts are run by normal tools.</td><td>You need procedural know-how, setup steps, CLIs, references, or domain workflow.</td></tr>
+            <tr><td><strong>Extensions</strong><br><code>extensions/*.ts</code></td><td>TypeScript modules executed by pi.</td><td>Tools/guidelines can be exposed; code itself is not prompt text.</td><td>Yes, with your system permissions.</td><td>You need actual hooks: tools, slash commands, UI, events, permissions, providers.</td></tr>
+            <tr><td><strong>Themes</strong><br><code>themes/*.json</code></td><td>Color definitions for pi's TUI.</td><td>No.</td><td>No.</td><td>You want visual customization and HTML export colors.</td></tr>
+            <tr><td><strong>Pi package</strong><br>this repo</td><td>A bundle of all the above, installable from local path, npm, or git.</td><td>No; it declares resources.</td><td>Depends on included extensions/skills.</td><td>You want a cloneable, shareable customization kit.</td></tr>
+            <tr><td><strong>SDK / RPC</strong></td><td>Embedding pi in another app or controlling it as a process.</td><td>N/A.</td><td>Yes, in your integration.</td><td>You are building a new UI, service, orchestrator, or automation around pi.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="lifecycle">
+      <h2>How pi hooks together at runtime</h2>
+      <div class="grid">
+        <div class="card span-8">
+          <h3>Startup and prompt flow</h3>
+          <div class="flow">
+            <span class="node">trust project</span><span class="arrow">→</span>
+            <span class="node">load extensions</span><span class="arrow">→</span>
+            <span class="node">discover skills/prompts/themes</span><span class="arrow">→</span>
+            <span class="node">user input</span><span class="arrow">→</span>
+            <span class="node">commands/templates/skills</span><span class="arrow">→</span>
+            <span class="node">LLM turn</span><span class="arrow">→</span>
+            <span class="node">tool calls</span><span class="arrow">→</span>
+            <span class="node">events + session history</span>
+          </div>
+          <p>Extensions sit across the whole flow. They can change the system prompt before a turn, inspect or rewrite context, block a tool call, mutate a tool result, create custom UI, or persist state into the session tree.</p>
+        </div>
+        <div class="card span-4">
+          <h3>Reload behavior</h3>
+          <p><code>/reload</code> reloads keybindings, extensions, skills, prompts, and context files. Themes hot-reload while editing the active theme.</p>
+          <p class="muted">For hot reload, prefer auto-discovered extension locations or package installs over one-off <code>pi -e</code> tests.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="extensions">
+      <h2>Extensions: the low-level hook layer</h2>
+      <div class="grid">
+        <div class="card span-6">
+          <h3>What an extension can add</h3>
+          <p><span class="tag">tools</span><span class="tag green">slash commands</span><span class="tag purple">keyboard shortcuts</span><span class="tag yellow">CLI flags</span><span class="tag">model providers</span><span class="tag purple">TUI components</span><span class="tag green">resource paths</span><span class="tag red">permission gates</span></p>
+          <p>Extensions export a default function that receives <code>ExtensionAPI</code>. The factory may be async, which is useful when discovering remote models before startup finishes.</p>
+        </div>
+        <div class="card span-6">
+          <h3>Minimal extension shape</h3>
+          <pre><code>import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+
+export default function (pi: ExtensionAPI) {
+  pi.on("tool_call", async (event, ctx) =&gt; {
+    // inspect, mutate, or block tool calls
+  });
+
+  pi.registerTool({
+    name: "my_tool",
+    description: "Does a thing for the model",
+    parameters: Type.Object({ input: Type.String() }),
+    async execute(id, params, signal, onUpdate, ctx) {
+      return { content: [{ type: "text", text: params.input }] };
+    }
+  });
+}</code></pre>
+        </div>
+        <div class="card span-12">
+          <h3>Important extension event families</h3>
+          <table>
+            <thead><tr><th>Family</th><th>Examples</th><th>What to build</th></tr></thead>
+            <tbody>
+              <tr><td>Lifecycle</td><td><code>project_trust</code>, <code>session_start</code>, <code>resources_discover</code>, <code>session_shutdown</code></td><td>Trust policy, cleanup, dynamic resource discovery, startup status.</td></tr>
+              <tr><td>Input and prompt</td><td><code>input</code>, <code>before_agent_start</code>, <code>context</code></td><td>Prompt modes, prompt rewriting, custom system instructions, context pruning.</td></tr>
+              <tr><td>Model/provider</td><td><code>model_select</code>, <code>thinking_level_select</code>, <code>before_provider_request</code>, <code>after_provider_response</code></td><td>Status bars, debugging serialized payloads, custom provider behavior.</td></tr>
+              <tr><td>Tools</td><td><code>tool_call</code>, <code>tool_result</code>, <code>tool_execution_update</code></td><td>Permission gates, path protection, result summarization, streaming progress.</td></tr>
+              <tr><td>Sessions</td><td><code>session_before_compact</code>, <code>session_before_tree</code>, <code>session_before_fork</code></td><td>Custom compaction, branch summaries, dirty-repo guards, checkpointing.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card span-6">
+          <h3>Tool-building notes</h3>
+          <ul>
+            <li>Use <code>typebox</code> schemas for arguments.</li>
+            <li>Throw errors to mark tool execution as failed.</li>
+            <li>Truncate large output to protect model context.</li>
+            <li>If mutating files, use pi's file mutation queue so parallel tool calls do not clobber each other.</li>
+            <li>Add <code>promptSnippet</code> and explicit <code>promptGuidelines</code> if you want the LLM to know when to use your tool.</li>
+          </ul>
+        </div>
+        <div class="card span-6">
+          <h3>UI-building notes</h3>
+          <ul>
+            <li><code>ctx.ui.notify/select/confirm/input/editor</code> handles common dialogs.</li>
+            <li><code>ctx.ui.custom()</code> temporarily replaces the editor with your own component.</li>
+            <li><code>setStatus</code>, <code>setWidget</code>, <code>setFooter</code>, <code>setEditorComponent</code>, and custom renderers let extensions reshape the TUI.</li>
+            <li>Guard TUI-only features with <code>ctx.mode === "tui"</code>; print and JSON modes have no UI.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="skills">
+      <h2>Skills, prompt templates, and themes</h2>
+      <div class="grid">
+        <div class="card span-4">
+          <h3>Skills</h3>
+          <p>Skills follow the Agent Skills pattern: a <code>SKILL.md</code> with frontmatter and instructions. Pi always advertises the name/description, then the model reads the full skill when useful.</p>
+          <pre><code>---
+name: cdp-browser
+description: Use CDP for rendered web pages.
+---
+# CDP Browser
+Run commands from this skill directory...</code></pre>
+        </div>
+        <div class="card span-4">
+          <h3>Prompt templates</h3>
+          <p>Markdown files in <code>prompts/</code> become slash commands. They support frontmatter, positional args, defaults, and <code>$@</code>/<code>$ARGUMENTS</code>.</p>
+          <pre><code>---
+description: Review staged changes
+argument-hint: "[focus]"
+---
+Review staged changes. Focus on $@</code></pre>
+        </div>
+        <div class="card span-4">
+          <h3>Themes</h3>
+          <p>JSON files in <code>themes/</code> define all TUI color tokens. Use them when you want a branded terminal experience or better contrast.</p>
+          <pre><code>{
+  "name": "my-theme",
+  "vars": { "accentBlue": "#65d6ff" },
+  "colors": { "accent": "accentBlue" }
+}</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="current">
+      <h2>Current customizations in this repo</h2>
+      <div class="grid">
+        <div class="card span-7">
+          <h3><code>extensions/powershell.ts</code></h3>
+          <p>This is a real extension that registers a PowerShell tool plus background-job tools:</p>
+          <p><span class="tag">powershell</span><span class="tag">pwsh-start-job</span><span class="tag">pwsh-get-job</span><span class="tag">pwsh-stop-job</span><span class="tag">pwsh-remove-job</span><span class="tag">pwsh-get-job-output</span></p>
+          <ul>
+            <li>Runs commands through <code>pwsh</code>, forcing UTF-8 output.</li>
+            <li>On Windows, disables <code>bash</code> by default and nudges the model toward PowerShell.</li>
+            <li>Streams partial command output during execution.</li>
+            <li>Starts detached background jobs for dev servers/watchers and captures logs.</li>
+            <li>Uses pi events (<code>session_start</code>, <code>before_agent_start</code>, <code>tool_call</code>) plus <code>registerTool</code>.</li>
+          </ul>
+        </div>
+        <div class="card span-5">
+          <h3><code>skills/cdp-browser</code></h3>
+          <p>A skill for web research through a real Chromium browser via the Chrome DevTools Protocol.</p>
+          <ul>
+            <li><code>scripts/start.js</code> launches Chrome with remote debugging.</li>
+            <li><code>search.js</code> queries a search page and extracts titles, URLs, snippets.</li>
+            <li><code>fetch.js</code> extracts rendered page text, with optional CSS selector.</li>
+            <li><code>nav.js</code>, <code>eval.js</code>, and <code>screenshot.js</code> support deeper inspection.</li>
+          </ul>
+          <pre><code><span class="shell"></span>cd skills/cdp-browser && npm install
+<span class="shell"></span>node scripts/start.js
+<span class="shell"></span>node scripts/cdp-browser.js search "pi coding agent"</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <section id="patterns">
+      <h2>Patterns from Mitsuhiko's <code>agent-stuff</code></h2>
+      <div class="grid">
+        <div class="card span-6">
+          <p>Armin Ronacher's public repository is a mature example of this exact idea: a personal pi package published as <code>mitsupi</code>. It bundles many skills, extensions, themes, and prompts under one installable package.</p>
+          <p>Notable patterns to copy:</p>
+          <ul>
+            <li><strong>Broad skill library:</strong> GitHub, web browser, tmux, uv, changelog, Sentry, diagrams, and more.</li>
+            <li><strong>Many small extensions:</strong> notifications, session analysis, review flows, todo UI, prompt editor, split/fork helpers.</li>
+            <li><strong>Distribution packages:</strong> separate common vs loaded sets for opinionated install profiles.</li>
+            <li><strong>Manifest filtering:</strong> include/exclude resources in <code>package.json</code>.</li>
+          </ul>
+        </div>
+        <div class="card span-6">
+          <h3>Why this matters for your repo</h3>
+          <p>Your repo can grow the same way: keep a simple top-level package, add narrowly scoped skills and extensions, and publish through GitHub or npm when stable.</p>
+          <pre><code>"pi": {
+  "extensions": ["./extensions", "!extensions/experimental.ts"],
+  "skills": ["./skills"],
+  "prompts": ["./prompts"],
+  "themes": ["./themes"]
+}</code></pre>
+          <p class="muted">Use exclusions for experiments you want in git but not installed by default.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="next">
+      <h2>Where should your next idea go?</h2>
+      <div class="card">
+        <table>
+          <thead><tr><th>Your idea</th><th>Best home</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td>“Teach the agent how I review PRs.”</td><td><code>prompts/review.md</code> or <code>skills/code-review/SKILL.md</code></td><td>Template if it is one prompt; skill if it has workflow, scripts, references, or setup.</td></tr>
+            <tr><td>“Add a new command the model can call.”</td><td><code>extensions/*.ts</code> with <code>registerTool</code></td><td>Only extensions can create actual model tools.</td></tr>
+            <tr><td>“Block dangerous commands or protected paths.”</td><td>Extension event handlers</td><td>Use <code>tool_call</code> to inspect and block before execution.</td></tr>
+            <tr><td>“Integrate a company LLM proxy.”</td><td>Extension with <code>registerProvider</code>, or <code>models.json</code> for simple OpenAI/Anthropic-compatible endpoints</td><td>Use config for static providers; extension for OAuth, dynamic discovery, or custom streaming.</td></tr>
+            <tr><td>“Add a browser / database / API workflow.”</td><td>Skill first, extension later if needed</td><td>Skills are easier to iterate; graduate to extension when you need durable tools or UI.</td></tr>
+            <tr><td>“Build plan mode, subagents, persistent state, or a TUI wizard.”</td><td>Extension</td><td>These need events, session APIs, custom UI, and possibly tools.</td></tr>
+            <tr><td>“Make pi look and feel like my setup.”</td><td>Theme plus UI extension</td><td>Colors go in themes; behavior/layout goes in extensions.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout warn" style="margin-top:18px">
+        <strong>Security model:</strong> installed pi packages are powerful. Extensions run arbitrary code with your permissions; skills can instruct the model to run bundled scripts. Review code before installing packages from other people, especially global installs.
+      </div>
+    </section>
+
+    <section id="pages">
+      <h2>Publishing this guide</h2>
+      <div class="grid">
+        <div class="card span-6">
+          <p>This file is intentionally placed at <code>docs/index.html</code>, which GitHub Pages can publish directly.</p>
+          <ol>
+            <li>Push this repo to GitHub.</li>
+            <li>Open repository <strong>Settings → Pages</strong>.</li>
+            <li>Set source to <strong>Deploy from a branch</strong>.</li>
+            <li>Choose your branch and the <code>/docs</code> folder.</li>
+          </ol>
+        </div>
+        <div class="card span-6">
+          <h3>Suggested next documentation additions</h3>
+          <ul>
+            <li>A gallery page for each extension/skill as this repo grows.</li>
+            <li>A “recipes” page with copy-paste starter extensions.</li>
+            <li>A compatibility page for Windows, macOS, and Linux-specific tools.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="wrap">
+      Built from the local repository inventory, pi documentation, and the public <a href="https://github.com/mitsuhiko/agent-stuff/">mitsuhiko/agent-stuff</a> package pattern. Last updated 2026-06-13.
+    </div>
+  </footer>
+</body>
+</html>
