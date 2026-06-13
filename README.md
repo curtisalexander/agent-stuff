@@ -92,6 +92,18 @@ After installing dependencies, reload pi if needed:
 
 ## Included extensions
 
+### `extensions/agentsview.ts`
+
+Adds an experimental AgentsView statusline and slash commands for Pi token/spend analytics:
+
+- footer status like `AV $0.42 sess · $3.18 today · 91k ctx`
+- `/av`, `/av-detail`, `/av-daily`, `/av-breakdown`, `/av-sync`, `/av-open`, `/av-statusline`
+- visual mode like `AV $2.89 · ▂█▁ in/cache/out · cache 85% · ctx ▄ 56k/128k · A`
+- current-session health/outcome details from AgentsView in `/av-detail`
+- uses the local `agentsview` CLI and Pi session files indexed by AgentsView
+
+See `docs/agentsview-extension-plan.md` for the design notes and follow-up research plan for system/user/output token attribution.
+
 ### `extensions/powershell.ts`
 
 Adds a `powershell` tool plus a set of background-job tools (`pwsh-start-job`,
