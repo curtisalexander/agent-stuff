@@ -47,6 +47,9 @@ const ctx = {
 		getSessionId: () => "powershell-test-session",
 		getSessionFile: () => join(repoRoot, "powershell-test-session.jsonl"),
 	},
+	ui: {
+		notify() {},
+	},
 };
 
 const foreground = requiredTool("powershell");
