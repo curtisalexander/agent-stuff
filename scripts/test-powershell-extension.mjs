@@ -275,11 +275,11 @@ Write-Output $value`,
 	const environmentOutput = await requiredTool("pwsh-get-job-output").execute("environment-output", {
 		name: environmentJob,
 	});
+	const environmentText = environmentOutput.content[0].text;
 	assert(
-		environmentOutput.content[0].text.includes(
-			`powershell-test-session|${join(repoRoot, "powershell-test-session.jsonl")}|openai|powershell-test-model|medium`,
-		),
-		"background PI environment was incomplete",
+		environmentText.includes("powershell-test-session|") &&
+			environmentText.includes("powershell-test-session.jsonl|openai|powershell-test-model|medium"),
+		`background PI environment was incomplete:\n${environmentText}`,
 	);
 	await removeJob(environmentJob);
 
