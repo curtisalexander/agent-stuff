@@ -623,7 +623,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 						trackingStopped: false,
 					};
 					jobs.set(params.name, record);
-					child.on("exit", (code) => void trackProcessGroupExit(record!, code));
+					child.on("close", (code) => void trackProcessGroupExit(record!, code));
 					child.on("error", () => markJobExited(record!));
 				}
 				await new Promise<void>((resolveSpawn, rejectSpawn) => {
