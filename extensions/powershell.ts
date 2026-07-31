@@ -16,7 +16,7 @@ import {
 import { Type } from "typebox";
 import { spawn, type ChildProcess } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
-import { access, mkdir, readFile, rm } from "node:fs/promises";
+import { access, mkdir, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
@@ -221,7 +221,7 @@ const powershellOperations: BashOperations = {
 			{
 				cwd,
 				env,
-				detached: true,
+				detached: !IS_WINDOWS,
 				stdio: ["ignore", "pipe", "pipe"],
 				windowsHide: true,
 			},
@@ -283,6 +283,7 @@ interface JobRecord {
 	ownedLogPaths: string[];
 	status: "running" | "exited";
 	child: ChildProcess;
+	trackingStopped: boolean;
 }
 
 const jobs = new Map<string, JobRecord>();
@@ -307,21 +308,42 @@ function resolveJobStream(
 }
 
 async function readJobFile(path: string, maxLines: number, maxBytes: number) {
+	let file;
 	try {
-		const content = await readFile(path, "utf8");
-		return truncateTail(content, { maxLines, maxBytes });
+		file = await open(path, "r");
+		const { size } = await file.stat();
+		const start = Math.max(0, size - maxBytes - 4);
+		const buffer = Buffer.alloc(size - start);
+		let bytesRead = 0;
+		while (bytesRead < buffer.length) {
+			const result = await file.read(buffer, bytesRead, buffer.length - bytesRead, start + bytesRead);
+			if (result.bytesRead === 0) break;
+			bytesRead += result.bytesRead;
+		}
+		let utf8Start = 0;
+		while (utf8Start < bytesRead && (buffer[utf8Start] & 0xc0) === 0x80) utf8Start++;
+		const truncation = truncateTail(buffer.subarray(utf8Start, bytesRead).toString("utf8"), {
+			maxLines,
+			maxBytes,
+		});
+		if (start > 0) {
+			truncation.truncated = true;
+			truncation.truncatedBy = "bytes";
+			truncation.totalBytes = size;
+		}
+		return { ...truncation, totalLinesKnown: start === 0 };
 	} catch (err: unknown) {
 		if ((err as NodeJS.ErrnoException).code === "ENOENT") {
 			return null;
 		}
 		throw err;
+	} finally {
+		await file?.close();
 	}
 }
 
 async function removeJobFiles(job: JobRecord) {
-	await Promise.all(
-		job.ownedLogPaths.map((p) => rm(p, { force: true }).catch(() => undefined)),
-	);
+	await Promise.all(job.ownedLogPaths.map((path) => rm(path, { force: true })));
 }
 
 function formatBool(v: boolean | undefined): string {
@@ -352,6 +374,18 @@ function markJobExited(job: JobRecord, code: number | null = job.child.exitCode)
 	job.endedAt ??= Date.now();
 }
 
+async function trackProcessGroupExit(job: JobRecord, code: number | null) {
+	if (IS_WINDOWS || !processGroupExists(job.pid)) {
+		markJobExited(job, code);
+		return;
+	}
+	job.exitCode = code ?? -1;
+	while (!job.trackingStopped && job.status === "running" && processGroupExists(job.pid)) {
+		await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+	}
+	if (!job.trackingStopped && job.status === "running") markJobExited(job, code);
+}
+
 async function stopJob(job: JobRecord) {
 	if (job.status === "exited") return;
 	if (!(await terminateProcessTree(job.child))) {
@@ -365,7 +399,8 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		if (!IS_WINDOWS) return;
 
 		const activeTools = new Set(pi.getActiveTools());
-		if (activeTools.has("bash")) {
+		const powershellAvailable = pi.getAllTools().some((tool) => tool.name === "powershell");
+		if (activeTools.has("bash") && powershellAvailable) {
 			activeTools.delete("bash");
 			activeTools.add("powershell");
 			pi.setActiveTools(Array.from(activeTools));
@@ -383,11 +418,21 @@ export default function powershellExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
-		await Promise.allSettled(Array.from(jobs.values(), (job) => stopJob(job)));
-		await Promise.allSettled(
-			Array.from(jobs.values(), (job) => (job.status === "exited" ? removeJobFiles(job) : Promise.resolve())),
+		const errors: Error[] = [];
+		await Promise.all(
+			Array.from(jobs.values(), async (job) => {
+				try {
+					await stopJob(job);
+					await removeJobFiles(job);
+					jobs.delete(job.name);
+				} catch (error) {
+					errors.push(new Error(`Failed to clean up PowerShell job '${job.name}' during shutdown.`, { cause: error }));
+				} finally {
+					job.trackingStopped = true;
+				}
+			}),
 		);
-		jobs.clear();
+		if (errors.length > 0) throw new AggregateError(errors, "PowerShell job cleanup failed during shutdown.");
 	});
 
 	const bashDefinition = createBashToolDefinition(process.cwd(), { operations: powershellOperations });
@@ -528,9 +573,10 @@ export default function powershellExtension(pi: ExtensionAPI) {
 					ownedLogPaths,
 					status: "running",
 					child,
+					trackingStopped: false,
 				};
 				jobs.set(params.name, record);
-				child.on("exit", (code) => markJobExited(record, code));
+				child.on("exit", (code) => void trackProcessGroupExit(record, code));
 				child.on("error", () => markJobExited(record));
 				child.unref();
 
@@ -673,7 +719,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 					sections.push(`(merged log not yet created at ${job.mergedPath})`);
 				} else {
 					sections.push(
-						`merged output (truncated=${formatBool(trunc.truncated)}, lines=${trunc.outputLines}/${trunc.totalLines}):\n${trunc.content.trimEnd()}`,
+						`merged output (truncated=${formatBool(trunc.truncated)}, lines=${trunc.outputLines}/${trunc.totalLinesKnown ? trunc.totalLines : "?"}, bytes=${trunc.outputBytes}/${trunc.totalBytes}):\n${trunc.content.trimEnd()}`,
 					);
 				}
 			}
@@ -682,7 +728,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				sections.push(
 					trunc === null
 						? `(stdout log not yet created at ${job.stdoutPath})`
-						: `stdout (truncated=${formatBool(trunc.truncated)}, lines=${trunc.outputLines}/${trunc.totalLines}):\n${trunc.content.trimEnd()}`,
+						: `stdout (truncated=${formatBool(trunc.truncated)}, lines=${trunc.outputLines}/${trunc.totalLinesKnown ? trunc.totalLines : "?"}, bytes=${trunc.outputBytes}/${trunc.totalBytes}):\n${trunc.content.trimEnd()}`,
 				);
 			}
 			if (job.stderrPath) {
@@ -690,7 +736,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				sections.push(
 					trunc === null
 						? `(stderr log not yet created at ${job.stderrPath})`
-						: `stderr (truncated=${formatBool(trunc.truncated)}, lines=${trunc.outputLines}/${trunc.totalLines}):\n${trunc.content.trimEnd()}`,
+						: `stderr (truncated=${formatBool(trunc.truncated)}, lines=${trunc.outputLines}/${trunc.totalLinesKnown ? trunc.totalLines : "?"}, bytes=${trunc.outputBytes}/${trunc.totalBytes}):\n${trunc.content.trimEnd()}`,
 				);
 			}
 			if (!job.mergedPath && !job.stdoutPath && !job.stderrPath) {

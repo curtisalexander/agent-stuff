@@ -131,7 +131,21 @@ npm run check
 npm run test:powershell
 ```
 
-`test:powershell` is a deterministic integration test that loads the extension, invokes real PowerShell without an LLM, and covers success, merged stdout/stderr, streaming, Pi session environment variables, nonzero exits, timeout, abort, large-output spill/truncation, background completion/stop, and custom-log preservation.
+`test:powershell` is a deterministic integration test that loads the extension, invokes real PowerShell without an LLM, and covers success, merged and separate stdout/stderr, streaming, Pi session environment variables, nonzero exits, timeout, abort, large foreground and background output truncation, background completion/stop, Unix descendant cleanup, custom-log preservation, and session shutdown cleanup.
+
+After configuring a model in Pi, run the model-driven integration test with:
+
+```bash
+npm run test:powershell:model
+```
+
+Pass Pi model options after `--` when needed, for example:
+
+```bash
+npm run test:powershell:model -- --model openai-codex/gpt-5.3-codex
+```
+
+This runs Pi non-interactively with only the relevant PowerShell extension tools enabled. It verifies five workflows from Pi's JSON event stream: Unicode stdout/stderr, foreground truncation and full-output metadata, timeout recovery, the complete background-job lifecycle, and separate background stdout/stderr logs. Every scenario uses randomized markers and checks the actual tool calls and results rather than trusting the model's final response.
 
 On Linux x64, install the pinned, checksum-verified PowerShell release without root access using:
 

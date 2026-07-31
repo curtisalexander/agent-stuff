@@ -14,7 +14,8 @@
     "check": "tsc --noEmit",
     "pi": "npx -y node@22.19.0 ./node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
     "setup:powershell": "bash scripts/install-powershell-linux.sh",
-    "test:powershell": "npx -y node@22.19.0 scripts/test-powershell-extension.mjs"
+    "test:powershell": "npx -y node@22.19.0 scripts/test-powershell-extension.mjs",
+    "test:powershell:model": "npx -y node@22.19.0 scripts/test-powershell-model.mjs"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -23,7 +24,7 @@
     "ws": "^8.20.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-coding-agent": ">=0.83.0",
     "typebox": "*"
   },
   "peerDependenciesMeta": {
