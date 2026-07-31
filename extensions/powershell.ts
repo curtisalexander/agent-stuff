@@ -1,33 +1,34 @@
 // Job tool API shape (pwsh-start-job / get / stop / remove / get-output, the
-// "null" discard sentinel, merged-by-default logging, UTF-8 prefix, .cmd/.bat
-// retry) is adapted from @marcfargas/pi-powershell (MIT). Implementation is
+// "null" discard sentinel, merged-by-default logging, and UTF-8 prefix) is
+// adapted from @marcfargas/pi-powershell (MIT). Implementation is
 // Node-native (child_process.spawn with detached + fd redirection) rather than
 // PowerShell's Start-Process.
 //   https://github.com/marcfargas/pi-powershell
 import {
+	createBashToolDefinition,
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
-	isToolCallEventType,
 	truncateTail,
+	type BashOperations,
 	type ExtensionAPI,
-} from "@mariozechner/pi-coding-agent";
+	type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawn, type ChildProcess } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
 const DEFAULT_SHELL = process.env.POWERSHELL_BIN || "pwsh";
 const IS_WINDOWS = process.platform === "win32";
-const STREAM_THROTTLE_MS = 120;
+const MAX_TIMEOUT_MS = 2_147_483_647;
+const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
+const EXIT_STDIO_GRACE_MS = 100;
 
 const UTF8_PREFIX =
 	"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " +
 	"$OutputEncoding = [System.Text.Encoding]::UTF8\n";
-
-const BATCH_FILE_RE = /\.(cmd|bat)(?=\s|$|'|")/i;
-const STARTS_WITH_CMD_RE = /^\s*"?cmd(?:\.exe)?"?(?:\s|$)/i;
 
 const INSTANCE_ID = `${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 let jobsDirPromise: Promise<string> | null = null;
@@ -50,135 +51,211 @@ function wrapCommand(command: string): string {
 	return UTF8_PREFIX + command;
 }
 
-function shouldRetryAsBatch(command: string, exitCode: number): boolean {
-	if (!IS_WINDOWS) return false;
-	if (exitCode === 0) return false;
-	if (STARTS_WITH_CMD_RE.test(command)) return false;
-	return BATCH_FILE_RE.test(command);
-}
-
-async function saveFullOutput(stdout: string, stderr: string): Promise<string> {
-	const dir = await mkdtemp(join(tmpdir(), "pi-powershell-"));
-	const file = join(dir, "full-output.txt");
-	await writeFile(file, [`# stdout`, stdout, ``, `# stderr`, stderr].join("\n"), "utf8");
-	return file;
-}
-
-interface RunResult {
-	stdout: string;
-	stderr: string;
-	exitCode: number;
-	timedOut: boolean;
-}
-
-type ChunkSink = (combined: string) => void;
-
-async function runProcess(
-	bin: string,
-	args: string[],
-	cwd: string,
-	timeoutSeconds: number | undefined,
-	signal: AbortSignal | undefined,
-	onChunk: ChunkSink | undefined,
-): Promise<RunResult> {
-	const child = spawn(bin, args, {
-		cwd,
-		env: process.env,
-		stdio: ["ignore", "pipe", "pipe"],
-	});
-
-	let stdout = "";
-	let stderr = "";
-	let combined = "";
-	let timedOut = false;
-
-	let lastFlush = 0;
-	let pendingFlush: NodeJS.Timeout | undefined;
-	const flushChunk = () => {
-		if (!onChunk) return;
-		lastFlush = Date.now();
-		onChunk(combined);
-	};
-	const scheduleFlush = () => {
-		if (!onChunk) return;
-		const delta = Date.now() - lastFlush;
-		if (delta >= STREAM_THROTTLE_MS) {
-			flushChunk();
-			return;
-		}
-		if (pendingFlush) return;
-		pendingFlush = setTimeout(() => {
-			pendingFlush = undefined;
-			flushChunk();
-		}, STREAM_THROTTLE_MS - delta);
-	};
-
-	child.stdout.on("data", (chunk: Buffer) => {
-		const s = chunk.toString("utf8");
-		stdout += s;
-		combined += s;
-		scheduleFlush();
-	});
-	child.stderr.on("data", (chunk: Buffer) => {
-		const s = chunk.toString("utf8");
-		stderr += s;
-		combined += s;
-		scheduleFlush();
-	});
-
-	const abortHandler = () => {
-		child.kill("SIGTERM");
-	};
-	if (signal) {
-		if (signal.aborted) abortHandler();
-		signal.addEventListener("abort", abortHandler, { once: true });
+function createPiEnvironment(ctx: ExtensionContext): NodeJS.ProcessEnv {
+	const env = { ...process.env };
+	delete env.PI_SESSION_ID;
+	delete env.PI_SESSION_FILE;
+	delete env.PI_PROVIDER;
+	delete env.PI_MODEL;
+	delete env.PI_REASONING_LEVEL;
+	const sessionId = ctx.sessionManager.getSessionId();
+	const sessionFile = ctx.sessionManager.getSessionFile();
+	if (sessionId) env.PI_SESSION_ID = sessionId;
+	if (sessionFile) env.PI_SESSION_FILE = sessionFile;
+	if (ctx.model) {
+		env.PI_PROVIDER = ctx.model.provider;
+		env.PI_MODEL = ctx.model.id;
 	}
+	if (ctx.thinkingLevel) env.PI_REASONING_LEVEL = ctx.thinkingLevel;
+	return env;
+}
 
-	let timeoutId: NodeJS.Timeout | undefined;
-	if (typeof timeoutSeconds === "number" && timeoutSeconds > 0) {
-		timeoutId = setTimeout(() => {
-			timedOut = true;
-			child.kill("SIGTERM");
-		}, timeoutSeconds * 1000);
+function resolveTimeoutMs(timeout: number | undefined): number | undefined {
+	if (timeout === undefined) return undefined;
+	if (!Number.isFinite(timeout) || timeout <= 0) {
+		throw new Error("Invalid timeout: must be a finite number of seconds");
 	}
+	const timeoutMs = timeout * 1000;
+	if (timeoutMs > MAX_TIMEOUT_MS) {
+		throw new Error(`Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds`);
+	}
+	return timeoutMs;
+}
 
+function signalProcessGroup(pid: number, signal: "SIGTERM" | "SIGKILL") {
 	try {
-		const exitCode = await new Promise<number | null>((resolveProm, reject) => {
-			child.on("error", reject);
-			child.on("close", resolveProm);
-		});
-		if (pendingFlush) {
-			clearTimeout(pendingFlush);
-			pendingFlush = undefined;
-		}
-		if (onChunk) onChunk(combined);
-		return { stdout, stderr, exitCode: exitCode ?? -1, timedOut };
-	} finally {
-		if (timeoutId) clearTimeout(timeoutId);
-		if (signal) signal.removeEventListener("abort", abortHandler);
+		process.kill(-pid, signal);
+	} catch {
+		// The process group exited between the existence check and signal.
 	}
 }
 
-function runPowerShell(
-	command: string,
-	cwd: string,
-	timeoutSeconds: number | undefined,
-	signal: AbortSignal | undefined,
-	onChunk?: ChunkSink,
-): Promise<RunResult> {
-	const args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", wrapCommand(command)];
-	return runProcess(DEFAULT_SHELL, args, cwd, timeoutSeconds, signal, onChunk);
+function childHasExited(child: ChildProcess): boolean {
+	return child.exitCode !== null || child.signalCode !== null;
 }
 
-function runCmd(
-	command: string,
-	cwd: string,
-	timeoutSeconds: number | undefined,
-	signal: AbortSignal | undefined,
-	onChunk?: ChunkSink,
-): Promise<RunResult> {
-	return runProcess("cmd.exe", ["/c", command], cwd, timeoutSeconds, signal, onChunk);
+function processGroupExists(pid: number): boolean {
+	try {
+		process.kill(-pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
 }
+
+async function waitForProcessGroupExit(pid: number, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (processGroupExists(pid) && Date.now() < deadline) {
+		await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+	}
+	return !processGroupExists(pid);
+}
+
+async function taskkill(pid: number, force: boolean): Promise<number> {
+	return new Promise((resolveKill) => {
+		const args = ["/PID", String(pid), "/T"];
+		if (force) args.push("/F");
+		const killer = spawn("taskkill.exe", args, { stdio: "ignore", windowsHide: true });
+		killer.once("error", () => resolveKill(-1));
+		killer.once("close", (code) => resolveKill(code ?? -1));
+	});
+}
+
+async function terminateProcessTree(child: ChildProcess): Promise<boolean> {
+	if (!child.pid) return childHasExited(child);
+	if (IS_WINDOWS) {
+		const exitCode = await taskkill(child.pid, true);
+		return exitCode === 0 || childHasExited(child);
+	}
+	if (!processGroupExists(child.pid)) return true;
+	signalProcessGroup(child.pid, "SIGTERM");
+	if (await waitForProcessGroupExit(child.pid, 3_000)) return true;
+	signalProcessGroup(child.pid, "SIGKILL");
+	return waitForProcessGroupExit(child.pid, 3_000);
+}
+
+// Mirrors Pi's bash wait semantics: after the shell exits, keep accepting late
+// output while inherited pipes are active, but do not hang forever on quiet
+// descendants that retain a pipe handle.
+function waitForChildProcess(child: ChildProcess): Promise<number | null> {
+	return new Promise((resolveWait, rejectWait) => {
+		let settled = false;
+		let exited = false;
+		let exitCode: number | null = null;
+		let idleTimer: NodeJS.Timeout | undefined;
+		let stdoutEnded = child.stdout === null;
+		let stderrEnded = child.stderr === null;
+		const cleanup = () => {
+			if (idleTimer) clearTimeout(idleTimer);
+			child.removeListener("error", onError);
+			child.removeListener("exit", onExit);
+			child.removeListener("close", onClose);
+			child.stdout?.removeListener("end", onStdoutEnd);
+			child.stderr?.removeListener("end", onStderrEnd);
+			child.stdout?.removeListener("data", onData);
+			child.stderr?.removeListener("data", onData);
+		};
+		const finish = (code: number | null) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			resolveWait(code);
+		};
+		const maybeFinish = () => {
+			if (exited && stdoutEnded && stderrEnded) finish(exitCode);
+		};
+		const armIdleTimer = () => {
+			if (idleTimer) clearTimeout(idleTimer);
+			idleTimer = setTimeout(() => finish(exitCode), EXIT_STDIO_GRACE_MS);
+		};
+		const onData = () => {
+			if (exited && !settled) armIdleTimer();
+		};
+		const onStdoutEnd = () => {
+			stdoutEnded = true;
+			maybeFinish();
+		};
+		const onStderrEnd = () => {
+			stderrEnded = true;
+			maybeFinish();
+		};
+		const onError = (error: Error) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			rejectWait(error);
+		};
+		const onExit = (code: number | null) => {
+			exited = true;
+			exitCode = code;
+			maybeFinish();
+			if (!settled) armIdleTimer();
+		};
+		const onClose = (code: number | null) => finish(code);
+		child.stdout?.once("end", onStdoutEnd);
+		child.stderr?.once("end", onStderrEnd);
+		child.stdout?.on("data", onData);
+		child.stderr?.on("data", onData);
+		child.once("error", onError);
+		child.once("exit", onExit);
+		child.once("close", onClose);
+	});
+}
+
+const powershellOperations: BashOperations = {
+	async exec(command, cwd, { onData, signal, timeout, env }) {
+		const timeoutMs = resolveTimeoutMs(timeout);
+		if (signal?.aborted) throw new Error("aborted");
+		try {
+			await access(cwd);
+		} catch {
+			throw new Error(`Working directory does not exist: ${cwd}\nCannot execute PowerShell commands.`);
+		}
+		if (signal?.aborted) throw new Error("aborted");
+
+		const child = spawn(
+			DEFAULT_SHELL,
+			["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", wrapCommand(command)],
+			{
+				cwd,
+				env,
+				detached: true,
+				stdio: ["ignore", "pipe", "pipe"],
+				windowsHide: true,
+			},
+		);
+		child.stdout?.on("data", onData);
+		child.stderr?.on("data", onData);
+
+		let timedOut = false;
+		let timeoutId: NodeJS.Timeout | undefined;
+		let termination: Promise<boolean> | undefined;
+		const terminate = () => (termination ??= terminateProcessTree(child));
+		const onAbort = () => void terminate();
+		try {
+			if (timeoutMs !== undefined) {
+				timeoutId = setTimeout(() => {
+					timedOut = true;
+					void terminate();
+				}, timeoutMs);
+			}
+			if (signal) {
+				if (signal.aborted) onAbort();
+				else signal.addEventListener("abort", onAbort, { once: true });
+			}
+			const exitCode = await waitForChildProcess(child);
+			if (termination) await termination;
+			if (signal?.aborted) throw new Error("aborted");
+			if (timedOut) throw new Error(`timeout:${timeout}`);
+			return { exitCode };
+		} finally {
+			if (timeoutId) clearTimeout(timeoutId);
+			if (signal) signal.removeEventListener("abort", onAbort);
+		}
+	},
+};
 
 interface JobSummary {
 	name: string;
@@ -203,13 +280,15 @@ interface JobRecord {
 	mergedPath: string | null;
 	stdoutPath: string | null;
 	stderrPath: string | null;
+	ownedLogPaths: string[];
 	status: "running" | "exited";
 	child: ChildProcess;
 }
 
 const jobs = new Map<string, JobRecord>();
+const startingJobs = new Set<string>();
 
-type JobStreamSpec = { kind: "merged" } | { kind: "discard" } | { kind: "file"; path: string };
+type JobStreamSpec = { kind: "merged" } | { kind: "discard" } | { kind: "file"; path: string; owned: boolean };
 
 function resolveJobStream(
 	jobsDir: string,
@@ -222,9 +301,9 @@ function resolveJobStream(
 	if (bothDefault) return { kind: "merged" };
 	if (raw === "null") return { kind: "discard" };
 	if (raw && raw !== "default") {
-		return { kind: "file", path: isAbsolute(raw) ? raw : resolve(cwd, raw) };
+		return { kind: "file", path: isAbsolute(raw) ? raw : resolve(cwd, raw), owned: false };
 	}
-	return { kind: "file", path: join(jobsDir, `${name}-${slot}.log`) };
+	return { kind: "file", path: join(jobsDir, `${name}-${slot}.log`), owned: true };
 }
 
 async function readJobFile(path: string, maxLines: number, maxBytes: number) {
@@ -240,9 +319,8 @@ async function readJobFile(path: string, maxLines: number, maxBytes: number) {
 }
 
 async function removeJobFiles(job: JobRecord) {
-	const paths = [job.mergedPath, job.stdoutPath, job.stderrPath].filter((p): p is string => !!p);
 	await Promise.all(
-		paths.map((p) => rm(p, { force: true }).catch(() => undefined)),
+		job.ownedLogPaths.map((p) => rm(p, { force: true }).catch(() => undefined)),
 	);
 }
 
@@ -268,6 +346,20 @@ function summarizeJob(job: JobRecord): string {
 		.join("\n");
 }
 
+function markJobExited(job: JobRecord, code: number | null = job.child.exitCode) {
+	job.status = "exited";
+	job.exitCode = code ?? -1;
+	job.endedAt ??= Date.now();
+}
+
+async function stopJob(job: JobRecord) {
+	if (job.status === "exited") return;
+	if (!(await terminateProcessTree(job.child))) {
+		throw new Error(`Could not stop the process tree for job '${job.name}' (pid ${job.pid}).`);
+	}
+	markJobExited(job);
+}
+
 export default function powershellExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		if (!IS_WINDOWS) return;
@@ -290,101 +382,31 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("tool_call", async (event) => {
-		if (!IS_WINDOWS) return;
-		if (isToolCallEventType("bash", event)) {
-			return {
-				block: true,
-				reason:
-					"bash is disabled on Windows by the PowerShell extension. Use the powershell tool unless the user explicitly requests bash.",
-			};
-		}
+	pi.on("session_shutdown", async () => {
+		await Promise.allSettled(Array.from(jobs.values(), (job) => stopJob(job)));
+		await Promise.allSettled(
+			Array.from(jobs.values(), (job) => (job.status === "exited" ? removeJobFiles(job) : Promise.resolve())),
+		);
+		jobs.clear();
 	});
 
+	const bashDefinition = createBashToolDefinition(process.cwd(), { operations: powershellOperations });
 	pi.registerTool({
+		...bashDefinition,
 		name: "powershell",
 		label: "PowerShell",
 		description:
-			"Run PowerShell commands via pwsh. Useful for Windows-style shell commands, PowerShell pipelines, .ps1 scripts, registry or service inspection, and cross-platform pwsh workflows. Output is forced to UTF-8. On Windows, failed .cmd/.bat invocations retry automatically via cmd.exe /c.",
-		promptSnippet: "Run PowerShell commands with pwsh and return stdout/stderr plus exit status.",
+			`Run PowerShell commands via pwsh in the current working directory. Output is forced to UTF-8 and truncated to the last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB; full output is saved to a temp file when truncated. Optionally provide a timeout in seconds. Invoke batch files explicitly with cmd.exe /c when cmd syntax is required.`,
+		promptSnippet: "Execute PowerShell commands with pwsh",
 		promptGuidelines: [
 			"Use powershell instead of bash when the user explicitly asks for PowerShell or when Windows-specific commands are needed.",
 			"Prefer powershell for PowerShell syntax such as Get-ChildItem, Select-String, pipelines, or .ps1 scripts.",
 			"Use pwsh-start-job (not powershell with `&` backgrounding) when you need to run a dev server, test watcher, or any long-running process. pwsh-start-job survives across tool calls; a backgrounded powershell call does not.",
+			"Inspect PI_* environment variables for current model and session details.",
 		],
-		parameters: Type.Object({
-			command: Type.String({ description: "The PowerShell command to run" }),
-			cwd: Type.Optional(Type.String({ description: "Optional working directory, relative to the current project" })),
-			timeout: Type.Optional(Type.Number({ description: "Optional timeout in seconds" })),
-		}),
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const cwd = resolveWorkingDirectory(ctx.cwd, params.cwd);
-			const onChunk: ChunkSink | undefined = onUpdate
-				? (combined) => {
-						const preview = truncateTail(combined, {
-							maxLines: DEFAULT_MAX_LINES,
-							maxBytes: DEFAULT_MAX_BYTES,
-						});
-						onUpdate({
-							content: [{ type: "text", text: preview.content }],
-							details: {
-								command: params.command,
-								cwd,
-								streaming: true,
-							},
-						});
-				  }
-				: undefined;
-
-			let result = await runPowerShell(params.command, cwd, params.timeout, signal, onChunk);
-			let retriedViaCmd = false;
-			if (shouldRetryAsBatch(params.command, result.exitCode) && !result.timedOut) {
-				retriedViaCmd = true;
-				result = await runCmd(params.command, cwd, params.timeout, signal, onChunk);
-			}
-
-			const fullCombined = `${result.stdout}${result.stderr}`;
-			const stdoutTrunc = truncateTail(result.stdout, {
-				maxLines: DEFAULT_MAX_LINES,
-				maxBytes: DEFAULT_MAX_BYTES,
-			});
-			const stderrTrunc = truncateTail(result.stderr, {
-				maxLines: DEFAULT_MAX_LINES,
-				maxBytes: DEFAULT_MAX_BYTES,
-			});
-			const truncated = stdoutTrunc.truncated || stderrTrunc.truncated;
-			const fullOutputPath = truncated ? await saveFullOutput(result.stdout, result.stderr) : undefined;
-
-			const summary = [
-				`Command: ${params.command}`,
-				`Shell: ${retriedViaCmd ? "cmd.exe /c (retry after pwsh failure)" : DEFAULT_SHELL}`,
-				`Working directory: ${cwd}`,
-				`Exit code: ${result.exitCode}`,
-				result.timedOut ? `Timed out: yes` : undefined,
-				truncated && fullOutputPath ? `Full output saved to: ${fullOutputPath}` : undefined,
-			].filter(Boolean);
-
-			const sections = [summary.join("\n")];
-			if (stdoutTrunc.content.trim()) sections.push(`stdout:\n${stdoutTrunc.content.trimEnd()}`);
-			if (stderrTrunc.content.trim()) sections.push(`stderr:\n${stderrTrunc.content.trimEnd()}`);
-			if (!stdoutTrunc.content.trim() && !stderrTrunc.content.trim()) sections.push("(no output)");
-
-			return {
-				content: [{ type: "text", text: sections.join("\n\n") }],
-				details: {
-					command: params.command,
-					cwd,
-					exitCode: result.exitCode,
-					timedOut: result.timedOut,
-					truncated,
-					fullOutputPath,
-					retriedViaCmd,
-					stdoutBytes: Buffer.byteLength(result.stdout, "utf8"),
-					stderrBytes: Buffer.byteLength(result.stderr, "utf8"),
-					combinedBytes: Buffer.byteLength(fullCombined, "utf8"),
-				},
-				isError: result.exitCode !== 0 || result.timedOut,
-			};
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const definition = createBashToolDefinition(ctx.cwd, { operations: powershellOperations });
+			return definition.execute(toolCallId, params, signal, onUpdate, ctx);
 		},
 	});
 
@@ -400,7 +422,10 @@ export default function powershellExtension(pi: ExtensionAPI) {
 			"Pass `stderr: \"null\"` or `stdout: \"null\"` to pwsh-start-job to discard a stream; pass a file path to redirect it. Omit both for a single merged log.",
 		],
 		parameters: Type.Object({
-			name: Type.String({ description: "Unique job name for tracking" }),
+			name: Type.String({
+				description: "Unique portable job name (letters, numbers, dots, underscores, and hyphens; max 64 characters)",
+				pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+			}),
 			command: Type.String({ description: "The PowerShell command to run in the background" }),
 			workingDirectory: Type.Optional(
 				Type.String({ description: "Optional working directory, relative to the current project" }),
@@ -416,98 +441,118 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				}),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (jobs.has(params.name)) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (jobs.has(params.name) || startingJobs.has(params.name)) {
 				throw new Error(`Job '${params.name}' already exists. Remove it first with pwsh-remove-job.`);
 			}
-			const cwd = resolveWorkingDirectory(ctx.cwd, params.workingDirectory);
-			const jobsDir = await getJobsDir();
-			const bothDefault = params.stdout === undefined && params.stderr === undefined;
-			const stdoutSpec = resolveJobStream(jobsDir, cwd, params.name, "stdout", params.stdout, bothDefault);
-			const stderrSpec = resolveJobStream(jobsDir, cwd, params.name, "stderr", params.stderr, bothDefault);
+			if (signal?.aborted) throw new Error(`Starting job '${params.name}' was aborted.`);
+			startingJobs.add(params.name);
+			const openedFds = new Set<number>();
+			let child: ChildProcess | undefined;
+			let ownedLogPaths: string[] = [];
+			try {
+				const cwd = resolveWorkingDirectory(ctx.cwd, params.workingDirectory);
+				const jobsDir = await getJobsDir();
+				if (signal?.aborted) throw new Error(`Starting job '${params.name}' was aborted.`);
+				const bothDefault = params.stdout === undefined && params.stderr === undefined;
+				const stdoutSpec = resolveJobStream(jobsDir, cwd, params.name, "stdout", params.stdout, bothDefault);
+				const stderrSpec = resolveJobStream(jobsDir, cwd, params.name, "stderr", params.stderr, bothDefault);
+				const mergedPath = bothDefault ? join(jobsDir, `${params.name}.log`) : null;
+				let stdoutFd: number | "ignore" = "ignore";
+				let stderrFd: number | "ignore" = "ignore";
+				let stdoutPath: string | null = null;
+				let stderrPath: string | null = null;
+				const openLog = (path: string) => {
+					const fd = openSync(path, "w");
+					openedFds.add(fd);
+					return fd;
+				};
 
-			const mergedPath = bothDefault ? join(jobsDir, `${params.name}.log`) : null;
-
-			let stdoutFd: number | "ignore";
-			let stderrFd: number | "ignore";
-			let stdoutPath: string | null = null;
-			let stderrPath: string | null = null;
-
-			if (mergedPath) {
-				const fd = openSync(mergedPath, "w");
-				stdoutFd = fd;
-				stderrFd = fd;
-			} else {
-				if (stdoutSpec.kind === "discard") {
-					stdoutFd = "ignore";
-				} else if (stdoutSpec.kind === "file") {
-					stdoutPath = stdoutSpec.path;
-					stdoutFd = openSync(stdoutSpec.path, "w");
+				if (mergedPath) {
+					stdoutFd = openLog(mergedPath);
+					stderrFd = stdoutFd;
+					ownedLogPaths = [mergedPath];
 				} else {
-					stdoutFd = "ignore";
+					if (stdoutSpec.kind === "file") {
+						stdoutPath = stdoutSpec.path;
+						stdoutFd = openLog(stdoutPath);
+						if (stdoutSpec.owned) ownedLogPaths.push(stdoutPath);
+					}
+					if (stderrSpec.kind === "file") {
+						stderrPath = stderrSpec.path;
+						stderrFd = stderrPath === stdoutPath ? stdoutFd : openLog(stderrPath);
+						if (stderrSpec.owned) ownedLogPaths.push(stderrPath);
+					}
 				}
-				if (stderrSpec.kind === "discard") {
-					stderrFd = "ignore";
-				} else if (stderrSpec.kind === "file") {
-					stderrPath = stderrSpec.path;
-					stderrFd = openSync(stderrSpec.path, "w");
-				} else {
-					stderrFd = "ignore";
+
+				child = spawn(
+					DEFAULT_SHELL,
+					["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", wrapCommand(params.command)],
+					{
+						cwd,
+						env: createPiEnvironment(ctx),
+						detached: true,
+						stdio: ["ignore", stdoutFd, stderrFd],
+						windowsHide: true,
+					},
+				);
+				await new Promise<void>((resolveSpawn, rejectSpawn) => {
+					const onSpawn = () => {
+						child!.removeListener("error", onError);
+						resolveSpawn();
+					};
+					const onError = (error: Error) => {
+						child!.removeListener("spawn", onSpawn);
+						rejectSpawn(error);
+					};
+					child!.once("spawn", onSpawn);
+					child!.once("error", onError);
+				});
+				if (!child.pid) throw new Error(`Failed to spawn background process for job '${params.name}'.`);
+				if (signal?.aborted) {
+					await terminateProcessTree(child);
+					throw new Error(`Starting job '${params.name}' was aborted.`);
 				}
-			}
 
-			const child = spawn(
-				DEFAULT_SHELL,
-				["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", wrapCommand(params.command)],
-				{
-					cwd,
-					env: process.env,
-					detached: true,
-					stdio: ["ignore", stdoutFd, stderrFd],
-				},
-			);
-
-			if (typeof stdoutFd === "number") closeSync(stdoutFd);
-			if (typeof stderrFd === "number" && stderrFd !== stdoutFd) closeSync(stderrFd);
-
-			if (!child.pid) {
-				throw new Error(`Failed to spawn background process for job '${params.name}'.`);
-			}
-			child.unref();
-
-			const record: JobRecord = {
-				name: params.name,
-				pid: child.pid,
-				command: params.command,
-				cwd,
-				startedAt: Date.now(),
-				endedAt: null,
-				exitCode: null,
-				mergedPath,
-				stdoutPath,
-				stderrPath,
-				status: "running",
-				child,
-			};
-			jobs.set(params.name, record);
-
-			child.on("exit", (code) => {
-				record.status = "exited";
-				record.exitCode = code ?? -1;
-				record.endedAt = Date.now();
-			});
-
-			return {
-				content: [{ type: "text", text: `Started job '${params.name}' (pid ${child.pid}).\n\n${summarizeJob(record)}` }],
-				details: {
+				const record: JobRecord = {
 					name: params.name,
 					pid: child.pid,
+					command: params.command,
 					cwd,
+					startedAt: Date.now(),
+					endedAt: null,
+					exitCode: null,
 					mergedPath,
 					stdoutPath,
 					stderrPath,
-				},
-			};
+					ownedLogPaths,
+					status: "running",
+					child,
+				};
+				jobs.set(params.name, record);
+				child.on("exit", (code) => markJobExited(record, code));
+				child.on("error", () => markJobExited(record));
+				child.unref();
+
+				return {
+					content: [{ type: "text", text: `Started job '${params.name}' (pid ${child.pid}).\n\n${summarizeJob(record)}` }],
+					details: {
+						name: params.name,
+						pid: child.pid,
+						cwd,
+						mergedPath,
+						stdoutPath,
+						stderrPath,
+					},
+				};
+			} catch (error) {
+				if (child?.pid && !childHasExited(child)) await terminateProcessTree(child);
+				await Promise.allSettled(ownedLogPaths.map((path) => rm(path, { force: true })));
+				throw error;
+			} finally {
+				for (const fd of openedFds) closeSync(fd);
+				startingJobs.delete(params.name);
+			}
 		},
 	});
 
@@ -563,7 +608,8 @@ export default function powershellExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "pwsh-stop-job",
 		label: "Stop PowerShell Job",
-		description: "Stop a running background PowerShell job. Sends SIGTERM, then SIGKILL after 3 seconds if still alive.",
+		description:
+			"Stop an entire background PowerShell process tree. Uses taskkill /T /F on Windows; on macOS and Linux it sends SIGTERM, then SIGKILL after 3 seconds if the process group is still alive.",
 		promptSnippet: "Stop a running pwsh background job.",
 		parameters: Type.Object({
 			name: Type.String({ description: "Job name to stop" }),
@@ -572,27 +618,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 			const job = jobs.get(params.name);
 			if (!job) throw new Error(`No job named '${params.name}'.`);
 			const alreadyExited = job.status === "exited";
-			if (!alreadyExited) {
-				try {
-					job.child.kill("SIGTERM");
-				} catch {
-					// already dead; ignore
-				}
-				await new Promise<void>((resolveWait) => {
-					const timer = setTimeout(() => {
-						try {
-							job.child.kill("SIGKILL");
-						} catch {
-							// ignore
-						}
-						resolveWait();
-					}, 3000);
-					job.child.once("exit", () => {
-						clearTimeout(timer);
-						resolveWait();
-					});
-				});
-			}
+			if (!alreadyExited) await stopJob(job);
 			const text = alreadyExited
 				? `Job '${params.name}' already exited (code ${job.exitCode ?? "-"}).`
 				: `Stopped job '${params.name}'.\n\n${summarizeJob(job)}`;
@@ -614,27 +640,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params) {
 			const job = jobs.get(params.name);
 			if (!job) throw new Error(`No job named '${params.name}'.`);
-			if (job.status === "running") {
-				try {
-					job.child.kill("SIGTERM");
-				} catch {
-					// ignore
-				}
-				await new Promise<void>((resolveWait) => {
-					const timer = setTimeout(() => {
-						try {
-							job.child.kill("SIGKILL");
-						} catch {
-							// ignore
-						}
-						resolveWait();
-					}, 3000);
-					job.child.once("exit", () => {
-						clearTimeout(timer);
-						resolveWait();
-					});
-				});
-			}
+			if (job.status === "running") await stopJob(job);
 			await removeJobFiles(job);
 			jobs.delete(params.name);
 			return {

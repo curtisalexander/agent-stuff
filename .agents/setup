@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+node_version="22.19.0"
+npm_cli="$(readlink -f "$(command -v npm)")"
+
+echo "Caching Node.js $node_version required by Pi..."
+npx -y "node@$node_version" --version
+
+echo "Installing Node dependencies..."
+npx -y "node@$node_version" "$npm_cli" ci
+
+echo "Installing PowerShell Core when needed..."
+bash scripts/install-powershell-linux.sh
+
+echo "Checking the repository..."
+npx -y "node@$node_version" "$npm_cli" run check

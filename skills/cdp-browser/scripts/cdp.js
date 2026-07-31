@@ -86,7 +86,13 @@ export class CDPClient {
 		});
 
 		this.ws.on("message", (raw) => {
-			const message = JSON.parse(raw.toString());
+			let message;
+			try {
+				message = JSON.parse(raw.toString());
+			} catch {
+				this.ws.terminate();
+				return;
+			}
 			if (message.id) {
 				const pending = this.pending.get(message.id);
 				if (!pending) return;
@@ -101,6 +107,10 @@ export class CDPClient {
 		this.ws.on("close", () => {
 			this.closed = true;
 			for (const pending of this.pending.values()) pending.reject(new Error("CDP websocket closed"));
+			this.pending.clear();
+		});
+		this.ws.on("error", (error) => {
+			for (const pending of this.pending.values()) pending.reject(error);
 			this.pending.clear();
 		});
 	}
@@ -194,7 +204,51 @@ export class CDPClient {
 	}
 
 	async navigate(sessionId, url, timeout = 30000) {
-		await this.send("Page.navigate", { url }, sessionId, timeout);
+		const result = await this.send("Page.navigate", { url }, sessionId, timeout);
+		if (result.errorText) throw new Error(`Navigation failed: ${result.errorText}`);
+		return result;
+	}
+
+	async navigateAndWait(sessionId, url, timeout = 20000) {
+		let navigationStarted = false;
+		let loaded = false;
+		const stoppedFrames = new Set();
+		let notifyLoad = () => {};
+		const unsubLoad = this.on("Page.loadEventFired", (_params, eventSessionId) => {
+			if (navigationStarted && eventSessionId === sessionId) {
+				loaded = true;
+				notifyLoad();
+			}
+		});
+		const unsubStop = this.on("Page.frameStoppedLoading", (params, eventSessionId) => {
+			if (navigationStarted && eventSessionId === sessionId) {
+				stoppedFrames.add(params.frameId);
+				notifyLoad();
+			}
+		});
+		try {
+			const result = await this.navigate(sessionId, url, timeout);
+			navigationStarted = true;
+			if (loaded || stoppedFrames.has(result.frameId)) return;
+			const readyState = await this.evaluate(sessionId, "document.readyState", Math.min(timeout, 5000));
+			if (readyState === "complete") return;
+			await new Promise((resolve, reject) => {
+				const timeoutId = setTimeout(
+					() => reject(new Error(`Timed out waiting for page load after ${timeout}ms`)),
+					timeout,
+				);
+				notifyLoad = () => {
+					if (loaded || stoppedFrames.has(result.frameId)) {
+						clearTimeout(timeoutId);
+						resolve();
+					}
+				};
+				notifyLoad();
+			});
+		} finally {
+			unsubLoad();
+			unsubStop();
+		}
 	}
 
 	async waitForLoad(sessionId, timeout = 20000) {
@@ -243,7 +297,14 @@ export class CDPClient {
 	async close() {
 		if (!this.ws || this.closed) return;
 		await new Promise((resolve) => {
-			this.ws.once("close", resolve);
+			const timer = setTimeout(() => {
+				this.ws.terminate();
+				resolve();
+			}, 1000);
+			this.ws.once("close", () => {
+				clearTimeout(timer);
+				resolve();
+			});
 			this.ws.close();
 		});
 	}
@@ -275,8 +336,7 @@ export async function withPage(options, fn) {
 		sessionId = await client.attachToPage(targetId);
 		await client.enablePage(sessionId);
 		if (navigateTo) {
-			await client.navigate(sessionId, navigateTo, timeout);
-			await client.waitForLoad(sessionId, timeout);
+			await client.navigateAndWait(sessionId, navigateTo, timeout);
 		}
 		return await fn({ client, sessionId, targetId });
 	} finally {

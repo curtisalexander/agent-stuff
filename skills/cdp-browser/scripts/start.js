@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
 import { spawn, execSync } from "node:child_process";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { ensureBrowserAvailable } from "./cdp.js";
+import { DEFAULT_BROWSER_URL, ensureBrowserAvailable } from "./cdp.js";
 
 const args = new Set(process.argv.slice(2));
 const useProfile = args.has("--profile");
@@ -23,8 +23,16 @@ function resolveChromeBinary() {
 		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
 		"/Applications/Chromium.app/Contents/MacOS/Chromium",
 		"/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+		"/usr/bin/google-chrome",
+		"/usr/bin/google-chrome-stable",
+		"/usr/bin/chromium",
+		"/usr/bin/chromium-browser",
+		"/usr/bin/microsoft-edge",
+		process.env.PROGRAMFILES && join(process.env.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe"),
+		process.env["PROGRAMFILES(X86)"] && join(process.env["PROGRAMFILES(X86)"], "Microsoft", "Edge", "Application", "msedge.exe"),
+		process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe"),
 	];
-	return candidates.find((path) => existsSync(path)) || null;
+	return candidates.find((path) => path && existsSync(path)) || null;
 }
 
 try {
@@ -35,9 +43,13 @@ try {
 	// continue and start browser
 }
 
-execSync(`mkdir -p ${JSON.stringify(cacheDir)}`);
+mkdirSync(cacheDir, { recursive: true });
 
 if (useProfile) {
+	if (process.platform !== "darwin") {
+		console.error("✗ --profile currently supports Google Chrome on macOS only");
+		process.exit(1);
+	}
 	const source = join(homedir(), "Library", "Application Support", "Google", "Chrome") + "/";
 	execSync(
 		`rsync -a --delete --exclude 'Singleton*' --exclude 'DevToolsActivePort*' ${JSON.stringify(source)} ${JSON.stringify(cacheDir + "/")}`,
@@ -55,8 +67,15 @@ if (!chromeBinary) {
 	process.exit(1);
 }
 
+const endpoint = new URL(DEFAULT_BROWSER_URL);
+if (!["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname) || endpoint.protocol !== "http:") {
+	console.error(`✗ CDP_BROWSER_URL must be a loopback HTTP URL, got ${DEFAULT_BROWSER_URL}`);
+	process.exit(1);
+}
+const debuggingPort = endpoint.port || "9222";
+
 const chromeArgs = [
-	"--remote-debugging-port=9222",
+	`--remote-debugging-port=${debuggingPort}`,
 	`--user-data-dir=${cacheDir}`,
 	"--profile-directory=Default",
 	"--disable-search-engine-choice-screen",
@@ -66,7 +85,15 @@ const chromeArgs = [
 ];
 
 const child = spawn(chromeBinary, chromeArgs, { detached: true, stdio: "ignore" });
-child.unref();
+try {
+	await new Promise((resolveSpawn, rejectSpawn) => {
+		child.once("spawn", resolveSpawn);
+		child.once("error", rejectSpawn);
+	});
+} catch (error) {
+	console.error(`✗ Failed to launch ${chromeBinary}: ${error.message}`);
+	process.exit(1);
+}
 
 let ready = false;
 for (let i = 0; i < 30; i++) {
@@ -80,8 +107,21 @@ for (let i = 0; i < 30; i++) {
 }
 
 if (!ready) {
+	if (child.pid) {
+		if (process.platform === "win32") {
+			const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+			killer.on("error", () => {});
+		} else {
+			try {
+				process.kill(-child.pid, "SIGTERM");
+			} catch {
+				// Process already exited.
+			}
+		}
+	}
 	console.error(`✗ Failed to start Chrome with CDP using ${chromeBinary}`);
 	process.exit(1);
 }
 
+child.unref();
 console.log(`✓ Chrome started with CDP${useProfile ? " using copied profile" : ""}`);

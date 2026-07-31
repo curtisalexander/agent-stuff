@@ -141,9 +141,7 @@
           <pre><code>{
   "pi": {
     "extensions": ["./extensions"],
-    "skills": ["./skills"],
-    "prompts": ["./prompts"],
-    "themes": ["./themes"]
+    "skills": ["./skills"]
   }
 }</code></pre>
           <p class="muted">If the manifest were absent, pi would still auto-discover these conventional directories.</p>
@@ -159,21 +157,20 @@
 ├── package.json          pi package manifest
 ├── README.md             quick setup and inventory
 ├── extensions/
+│   ├── agentsview.ts     usage analytics and statusline
 │   └── powershell.ts     custom tools and Windows behavior
 ├── skills/
 │   └── cdp-browser/
 │       ├── SKILL.md      on-demand browser instructions
-│       ├── package.json  local ws dependency
 │       └── scripts/      CDP helper commands
-├── prompts/              reusable slash prompt templates
-└── themes/               terminal UI theme JSON files</div>
+└── docs/                 design notes and this guide</div>
         </div>
         <div class="card span-6">
           <h3>What is currently populated?</h3>
           <ul>
-            <li><strong>One extension:</strong> <code>extensions/powershell.ts</code>.</li>
+            <li><strong>Two extensions:</strong> <code>extensions/agentsview.ts</code> and <code>extensions/powershell.ts</code>.</li>
             <li><strong>One skill:</strong> <code>skills/cdp-browser</code>, with JavaScript helper scripts.</li>
-            <li><strong>Empty conventional directories:</strong> <code>prompts/</code> and <code>themes/</code> are ready for future resources.</li>
+            <li><strong>Shared dependencies:</strong> runtime packages used by skills are declared in the root <code>package.json</code>, so <code>pi install</code> installs them automatically.</li>
           </ul>
           <p class="muted">This is already a valid pi package. It is a small starting point, not a random scripts folder.</p>
         </div>
@@ -344,9 +341,9 @@ Review staged changes. Focus on $@</code></pre>
             <li><code>fetch.js</code> extracts rendered page text, with optional CSS selector.</li>
             <li><code>nav.js</code>, <code>eval.js</code>, and <code>screenshot.js</code> support deeper inspection.</li>
           </ul>
-          <pre><code><span class="shell"></span>cd skills/cdp-browser && npm install
-<span class="shell"></span>node scripts/start.js
-<span class="shell"></span>node scripts/cdp-browser.js search "pi coding agent"</code></pre>
+          <pre><code><span class="shell"></span>npm install
+<span class="shell"></span>node skills/cdp-browser/scripts/start.js
+<span class="shell"></span>node skills/cdp-browser/scripts/cdp-browser.js search "pi coding agent"</code></pre>
         </div>
       </div>
     </section>

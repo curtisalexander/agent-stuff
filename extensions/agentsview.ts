@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
@@ -106,16 +106,27 @@ type AgentsViewState = {
 	lastBreakdown?: PromptBreakdown;
 	lastError?: string;
 	refreshing: boolean;
+	generation: number;
 };
 
 const state: AgentsViewState = {
 	installed: undefined,
 	mode: "compact",
 	refreshing: false,
+	generation: 0,
 };
+
+let refreshQueue: Promise<void> = Promise.resolve();
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
+		state.generation++;
+		state.mode = "compact";
+		state.sessionUsage = undefined;
+		state.sessionDetail = undefined;
+		state.pendingBreakdown = undefined;
+		state.lastBreakdown = undefined;
+		state.lastError = undefined;
 		restoreState(ctx);
 		state.currentSessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
 		state.currentSessionId = sessionIdFromFile(state.currentSessionFile);
@@ -164,6 +175,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		state.generation++;
 		ctx.ui.setStatus(STATUS_KEY, "");
 	});
 
@@ -214,8 +226,12 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("AgentsView CLI not found. Install with: brew install --cask agentsview", "warning");
 				return;
 			}
-			openAgentsView();
-			ctx.ui.notify("Opening AgentsView at http://127.0.0.1:8080", "info");
+			try {
+				await openAgentsView();
+				ctx.ui.notify("Opening AgentsView at http://127.0.0.1:8080", "info");
+			} catch (error) {
+				ctx.ui.notify(`Could not open AgentsView: ${shortError(error)}`, "warning");
+			}
 		},
 	});
 
@@ -236,7 +252,13 @@ export default function (pi: ExtensionAPI) {
 }
 
 async function refresh(ctx: ExtensionContext, options: { sync: boolean }) {
-	if (state.refreshing) return;
+	const generation = state.generation;
+	refreshQueue = refreshQueue.catch(() => undefined).then(() => refreshNow(ctx, options, generation));
+	return refreshQueue;
+}
+
+async function refreshNow(ctx: ExtensionContext, options: { sync: boolean }, generation: number) {
+	if (generation !== state.generation) return;
 	state.refreshing = true;
 	state.lastError = undefined;
 	state.currentSessionFile = ctx.sessionManager.getSessionFile() ?? state.currentSessionFile;
@@ -251,26 +273,34 @@ async function refresh(ctx: ExtensionContext, options: { sync: boolean }) {
 		}
 
 		if (options.sync && state.currentSessionFile && existsSync(state.currentSessionFile)) {
-			await syncCurrentSession().catch((error) => {
+			await syncCurrentSession(generation).catch((error) => {
 				// Keep going: if sync fails because the file maps to multiple sessions, the derived id may still work.
-				state.lastError = shortError(error);
+				if (generation === state.generation) state.lastError = shortError(error);
 			});
 		}
 
-		const results = await Promise.allSettled([refreshSessionUsage(), refreshSessionDetail(), refreshDaily(ctx)]);
+		const results = await Promise.allSettled([
+			refreshSessionUsage(generation),
+			refreshSessionDetail(generation),
+			refreshDaily(ctx, generation),
+		]);
 		const firstFailure = results.find((result) => result.status === "rejected") as PromiseRejectedResult | undefined;
-		if (firstFailure && !state.lastError) state.lastError = shortError(firstFailure.reason);
+		if (generation === state.generation && firstFailure && !state.lastError) state.lastError = shortError(firstFailure.reason);
 	} catch (error) {
-		state.lastError = shortError(error);
+		if (generation === state.generation) state.lastError = shortError(error);
 	} finally {
-		state.refreshing = false;
-		updateStatus(ctx);
+		if (generation === state.generation) {
+			state.refreshing = false;
+			updateStatus(ctx);
+		}
 	}
 }
 
-async function syncCurrentSession() {
-	if (!state.currentSessionFile) return;
-	const stdout = await av(["session", "sync", state.currentSessionFile, "--format", "json"], 30_000);
+async function syncCurrentSession(generation = state.generation) {
+	const sessionFile = state.currentSessionFile;
+	if (!sessionFile || generation !== state.generation) return;
+	const stdout = await av(["session", "sync", sessionFile, "--format", "json"], 30_000);
+	if (generation !== state.generation) return;
 	const detail = JSON.parse(stdout) as SessionDetail;
 	if (detail.id) {
 		state.currentSessionId = detail.id;
@@ -278,20 +308,21 @@ async function syncCurrentSession() {
 	}
 }
 
-async function refreshSessionUsage() {
+async function refreshSessionUsage(generation = state.generation) {
+	if (generation !== state.generation) return;
 	if (!state.currentSessionId && state.currentSessionFile && existsSync(state.currentSessionFile)) {
-		await syncCurrentSession();
+		await syncCurrentSession(generation);
 	}
-	if (!state.currentSessionId) return;
+	if (!state.currentSessionId || generation !== state.generation) return;
 	try {
 		const stdout = await av(["session", "usage", state.currentSessionId, "--format", "json"]);
-		state.sessionUsage = JSON.parse(stdout) as SessionUsage;
+		if (generation === state.generation) state.sessionUsage = JSON.parse(stdout) as SessionUsage;
 	} catch (error) {
-		if (state.currentSessionFile && existsSync(state.currentSessionFile)) {
-			await syncCurrentSession();
-			if (state.currentSessionId) {
+		if (generation === state.generation && state.currentSessionFile && existsSync(state.currentSessionFile)) {
+			await syncCurrentSession(generation);
+			if (state.currentSessionId && generation === state.generation) {
 				const stdout = await av(["session", "usage", state.currentSessionId, "--format", "json"]);
-				state.sessionUsage = JSON.parse(stdout) as SessionUsage;
+				if (generation === state.generation) state.sessionUsage = JSON.parse(stdout) as SessionUsage;
 				return;
 			}
 		}
@@ -299,16 +330,16 @@ async function refreshSessionUsage() {
 	}
 }
 
-async function refreshSessionDetail() {
-	if (!state.currentSessionId) return;
+async function refreshSessionDetail(generation = state.generation) {
+	if (!state.currentSessionId || generation !== state.generation) return;
 	const stdout = await av(["session", "get", state.currentSessionId, "--format", "json"]);
-	state.sessionDetail = JSON.parse(stdout) as SessionDetail;
+	if (generation === state.generation) state.sessionDetail = JSON.parse(stdout) as SessionDetail;
 }
 
-async function refreshDaily(_ctx: ExtensionContext) {
+async function refreshDaily(_ctx: ExtensionContext, generation = state.generation) {
 	const today = new Date().toISOString().slice(0, 10);
 	const stdout = await av(["usage", "daily", "--json", "--agent", "pi", "--since", today, "--no-sync"]);
-	state.dailyUsage = JSON.parse(stdout) as DailyUsage;
+	if (generation === state.generation) state.dailyUsage = JSON.parse(stdout) as DailyUsage;
 }
 
 async function ensureInstalled() {
@@ -484,17 +515,47 @@ function sessionIdFromFile(file: string | undefined) {
 	return match ? `pi:${match[1]}` : undefined;
 }
 
-function openAgentsView() {
-	const server = spawn("agentsview", ["serve", "--no-browser"], {
-		detached: true,
-		stdio: "ignore",
-	});
-	server.unref();
+async function openAgentsView() {
+	const url = "http://127.0.0.1:8080";
+	if (!(await agentsViewServerReady(url))) {
+		const server = spawn("agentsview", ["serve", "--no-browser"], { detached: true, stdio: "ignore" });
+		await waitForSpawn(server, "AgentsView server");
+		server.unref();
+		for (let attempt = 0; attempt < 20 && !(await agentsViewServerReady(url)); attempt++) {
+			await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+		}
+		if (!(await agentsViewServerReady(url))) throw new Error("server did not become ready");
+	}
 
-	const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
-	const args = process.platform === "win32" ? ["/c", "start", "", "http://127.0.0.1:8080"] : ["http://127.0.0.1:8080"];
+	const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd.exe" : "xdg-open";
+	const args = process.platform === "win32" ? ["/d", "/s", "/c", "start", "", url] : [url];
 	const child = spawn(opener, args, { detached: true, stdio: "ignore" });
+	await waitForSpawn(child, "browser opener");
 	child.unref();
+}
+
+async function agentsViewServerReady(url: string) {
+	try {
+		const response = await fetch(url, { signal: AbortSignal.timeout(750) });
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
+async function waitForSpawn(child: ReturnType<typeof spawn>, label: string) {
+	await new Promise<void>((resolveSpawn, rejectSpawn) => {
+		const onSpawn = () => {
+			child.removeListener("error", onError);
+			resolveSpawn();
+		};
+		const onError = (error: Error) => {
+			child.removeListener("spawn", onSpawn);
+			rejectSpawn(new Error(`${label} failed: ${error.message}`));
+		};
+		child.once("spawn", onSpawn);
+		child.once("error", onError);
+	});
 }
 
 function formatVisualStatus() {

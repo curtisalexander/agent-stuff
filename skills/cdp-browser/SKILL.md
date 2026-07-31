@@ -22,10 +22,10 @@ This skill now uses a more robust multi-script layout inspired by Armin Ronacher
 
 ## Setup
 
-Install the local dependency once:
+When using this skill from a development checkout, install package dependencies once at the repository root:
 
 ```bash
-cd skills/cdp-browser && npm install
+npm install
 ```
 
 Start Chrome or Chromium with remote debugging enabled.
@@ -43,6 +43,8 @@ To copy your Chrome profile first:
 ```bash
 node scripts/start.js --profile
 ```
+
+`--profile` currently supports Google Chrome on macOS only. It copies browser profile data (including potentially sensitive cookies and sessions) into `~/.cache/pi-cdp-browser`; review and protect that directory accordingly.
 
 ### Manual macOS examples
 

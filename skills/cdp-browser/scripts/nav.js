@@ -27,8 +27,7 @@ try {
 
 	const sessionId = await client.attachToPage(targetId);
 	await client.enablePage(sessionId);
-	await client.navigate(sessionId, url, 30000);
-	await client.waitForLoad(sessionId, 30000);
+	await client.navigateAndWait(sessionId, url, 30000);
 	console.log(created ? `✓ Opened: ${url}` : `✓ Navigated to: ${url}`);
 	await client.detach(sessionId).catch(() => {});
 } finally {
