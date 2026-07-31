@@ -605,6 +605,16 @@ export default function powershellExtension(pi: ExtensionAPI) {
 						windowsHide: true,
 					},
 				);
+				const childFds = Array.from(openedFds);
+				openedFds.clear();
+				let childFdsClosed = false;
+				const closeChildFds = () => {
+					if (childFdsClosed) return;
+					childFdsClosed = true;
+					for (const fd of childFds) closeSync(fd);
+				};
+				child.once("error", closeChildFds);
+				child.once("close", closeChildFds);
 				if (child.pid) {
 					record = {
 						name: params.name,
