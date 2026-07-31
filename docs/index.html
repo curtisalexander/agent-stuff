@@ -326,10 +326,10 @@ Review staged changes. Focus on $@</code></pre>
           <p><span class="tag">powershell</span><span class="tag">pwsh-start-job</span><span class="tag">pwsh-get-job</span><span class="tag">pwsh-stop-job</span><span class="tag">pwsh-remove-job</span><span class="tag">pwsh-get-job-output</span></p>
           <ul>
             <li>Runs commands through <code>pwsh</code>, forcing UTF-8 output.</li>
-            <li>On Windows, disables <code>bash</code> by default and nudges the model toward PowerShell.</li>
+            <li>On Windows, verifies PowerShell 7 before disabling <code>bash</code> and nudges the model toward PowerShell.</li>
             <li>Streams partial command output during execution.</li>
             <li>Starts detached background jobs for dev servers/watchers and captures logs.</li>
-            <li>Uses pi events (<code>session_start</code>, <code>before_agent_start</code>, <code>tool_call</code>) plus <code>registerTool</code>.</li>
+            <li>Uses pi events (<code>session_start</code>, <code>before_agent_start</code>, <code>session_shutdown</code>) plus <code>registerTool</code>.</li>
           </ul>
         </div>
         <div class="card span-5">

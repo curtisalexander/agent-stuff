@@ -25,6 +25,7 @@ const IS_WINDOWS = process.platform === "win32";
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 const EXIT_STDIO_GRACE_MS = 100;
+const POWERSHELL_PROBE_TIMEOUT_MS = 5_000;
 
 const UTF8_PREFIX =
 	"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " +
@@ -32,6 +33,7 @@ const UTF8_PREFIX =
 
 const INSTANCE_ID = `${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 let jobsDirPromise: Promise<string> | null = null;
+let powershellAvailabilityPromise: Promise<boolean> | null = null;
 
 async function getJobsDir(): Promise<string> {
 	if (!jobsDirPromise) {
@@ -49,6 +51,42 @@ function resolveWorkingDirectory(cwd: string, inputCwd?: string): string {
 
 function wrapCommand(command: string): string {
 	return UTF8_PREFIX + command;
+}
+
+export function probePowerShell(shell = DEFAULT_SHELL): Promise<boolean> {
+	return new Promise((resolveProbe) => {
+		let settled = false;
+		let child: ChildProcess;
+		let timeoutId: NodeJS.Timeout | undefined;
+		const finish = (available: boolean) => {
+			if (settled) return;
+			settled = true;
+			if (timeoutId) clearTimeout(timeoutId);
+			resolveProbe(available);
+		};
+		try {
+			child = spawn(
+				shell,
+				[
+					"-NoLogo",
+					"-NoProfile",
+					"-NonInteractive",
+					"-Command",
+					"if ($PSVersionTable.PSVersion.Major -ge 7) { exit 0 } else { exit 1 }",
+				],
+				{ stdio: "ignore", windowsHide: true },
+			);
+		} catch {
+			finish(false);
+			return;
+		}
+		timeoutId = setTimeout(() => {
+			child.kill();
+			finish(false);
+		}, POWERSHELL_PROBE_TIMEOUT_MS);
+		child.once("error", () => finish(false));
+		child.once("close", (code) => finish(code === 0));
+	});
 }
 
 function createPiEnvironment(ctx: ExtensionContext): NodeJS.ProcessEnv {
@@ -288,6 +326,8 @@ interface JobRecord {
 
 const jobs = new Map<string, JobRecord>();
 const startingJobs = new Set<string>();
+const startingJobOperations = new Set<Promise<void>>();
+let shuttingDown = false;
 
 type JobStreamSpec = { kind: "merged" } | { kind: "discard" } | { kind: "file"; path: string; owned: boolean };
 
@@ -396,11 +436,21 @@ async function stopJob(job: JobRecord) {
 
 export default function powershellExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
+		shuttingDown = false;
 		if (!IS_WINDOWS) return;
 
+		powershellAvailabilityPromise ??= probePowerShell();
+		if (!(await powershellAvailabilityPromise)) {
+			ctx.ui.notify(
+				`PowerShell 7 is unavailable at '${DEFAULT_SHELL}'. Bash was left enabled. Install PowerShell 7 or set POWERSHELL_BIN, then reload Pi.`,
+				"warning",
+			);
+			return;
+		}
+
 		const activeTools = new Set(pi.getActiveTools());
-		const powershellAvailable = pi.getAllTools().some((tool) => tool.name === "powershell");
-		if (activeTools.has("bash") && powershellAvailable) {
+		const powershellRegistered = pi.getAllTools().some((tool) => tool.name === "powershell");
+		if (activeTools.has("bash") && powershellRegistered) {
 			activeTools.delete("bash");
 			activeTools.add("powershell");
 			pi.setActiveTools(Array.from(activeTools));
@@ -410,6 +460,8 @@ export default function powershellExtension(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event) => {
 		if (!IS_WINDOWS) return;
+		powershellAvailabilityPromise ??= probePowerShell();
+		if (!(await powershellAvailabilityPromise)) return;
 		return {
 			systemPrompt:
 				event.systemPrompt +
@@ -418,6 +470,8 @@ export default function powershellExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		shuttingDown = true;
+		await Promise.allSettled(Array.from(startingJobOperations));
 		const errors: Error[] = [];
 		await Promise.all(
 			Array.from(jobs.values(), async (job) => {
@@ -446,7 +500,8 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use powershell instead of bash when the user explicitly asks for PowerShell or when Windows-specific commands are needed.",
 			"Prefer powershell for PowerShell syntax such as Get-ChildItem, Select-String, pipelines, or .ps1 scripts.",
-			"Use pwsh-start-job (not powershell with `&` backgrounding) when you need to run a dev server, test watcher, or any long-running process. pwsh-start-job survives across tool calls; a backgrounded powershell call does not.",
+			"For failure-sensitive automation, set $ErrorActionPreference = 'Stop', consider $PSNativeCommandUseErrorActionPreference = $true, and inspect $LASTEXITCODE when appropriate; PowerShell can otherwise report success after an earlier non-terminating error.",
+			"Use pwsh-start-job (not powershell with a trailing background operator such as `command &`) when you need to run a dev server, test watcher, or any long-running process. pwsh-start-job survives across tool calls; a backgrounded powershell call does not.",
 			"Inspect PI_* environment variables for current model and session details.",
 		],
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -459,10 +514,11 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		name: "pwsh-start-job",
 		label: "Start PowerShell Job",
 		description:
-			"Start a background PowerShell process. The process survives across tool calls as a detached OS process. Use for dev servers, test watchers, or any long-running task. Output is captured to a log file (merged by default) and readable via pwsh-get-job-output. Use pwsh-stop-job / pwsh-remove-job to clean up.",
+			"Start a background PowerShell process that survives across tool calls in the current Pi session runtime. Use for dev servers, test watchers, or other long-running tasks. Invoke the long-running program directly; do not use Start-Process, Start-Job, or another self-detaching launcher because it can escape tracking on Windows. Output is captured to a log file (merged by default) and readable via pwsh-get-job-output. Use pwsh-stop-job / pwsh-remove-job to clean up.",
 		promptSnippet: "Start a detached PowerShell background process, tracked by name.",
 		promptGuidelines: [
 			"Use pwsh-start-job for long-running processes (dev servers, watchers) so they persist across tool calls.",
+			"Invoke the long-running program directly. Do not use Start-Process, Start-Job, a trailing background operator (`command &`), or another self-detaching/backgrounding construct inside the command; on Windows an escaped process cannot be reliably tracked after the root pwsh exits. The `&` call operator remains appropriate for synchronous invocation.",
 			"Check status with pwsh-get-job, read output with pwsh-get-job-output, and always clean up with pwsh-remove-job when finished.",
 			"Pass `stderr: \"null\"` or `stdout: \"null\"` to pwsh-start-job to discard a stream; pass a file path to redirect it. Omit both for a single merged log.",
 		],
@@ -487,17 +543,25 @@ export default function powershellExtension(pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (shuttingDown) throw new Error(`Cannot start job '${params.name}' while the PowerShell extension is shutting down.`);
 			if (jobs.has(params.name) || startingJobs.has(params.name)) {
 				throw new Error(`Job '${params.name}' already exists. Remove it first with pwsh-remove-job.`);
 			}
 			if (signal?.aborted) throw new Error(`Starting job '${params.name}' was aborted.`);
+			let completeOperation!: () => void;
+			const operation = new Promise<void>((resolveOperation) => {
+				completeOperation = resolveOperation;
+			});
+			startingJobOperations.add(operation);
 			startingJobs.add(params.name);
 			const openedFds = new Set<number>();
 			let child: ChildProcess | undefined;
+			let record: JobRecord | undefined;
 			let ownedLogPaths: string[] = [];
 			try {
 				const cwd = resolveWorkingDirectory(ctx.cwd, params.workingDirectory);
 				const jobsDir = await getJobsDir();
+				if (shuttingDown) throw new Error(`Starting job '${params.name}' was interrupted by PowerShell extension shutdown.`);
 				if (signal?.aborted) throw new Error(`Starting job '${params.name}' was aborted.`);
 				const bothDefault = params.stdout === undefined && params.stderr === undefined;
 				const stdoutSpec = resolveJobStream(jobsDir, cwd, params.name, "stdout", params.stdout, bothDefault);
@@ -541,6 +605,27 @@ export default function powershellExtension(pi: ExtensionAPI) {
 						windowsHide: true,
 					},
 				);
+				if (child.pid) {
+					record = {
+						name: params.name,
+						pid: child.pid,
+						command: params.command,
+						cwd,
+						startedAt: Date.now(),
+						endedAt: null,
+						exitCode: null,
+						mergedPath,
+						stdoutPath,
+						stderrPath,
+						ownedLogPaths,
+						status: "running",
+						child,
+						trackingStopped: false,
+					};
+					jobs.set(params.name, record);
+					child.on("exit", (code) => void trackProcessGroupExit(record!, code));
+					child.on("error", () => markJobExited(record!));
+				}
 				await new Promise<void>((resolveSpawn, rejectSpawn) => {
 					const onSpawn = () => {
 						child!.removeListener("error", onError);
@@ -554,30 +639,16 @@ export default function powershellExtension(pi: ExtensionAPI) {
 					child!.once("error", onError);
 				});
 				if (!child.pid) throw new Error(`Failed to spawn background process for job '${params.name}'.`);
-				if (signal?.aborted) {
-					await terminateProcessTree(child);
-					throw new Error(`Starting job '${params.name}' was aborted.`);
+				if (!record) throw new Error(`Failed to track background process for job '${params.name}'.`);
+				if (shuttingDown || signal?.aborted) {
+					await stopJob(record);
+					throw new Error(
+						shuttingDown
+							? `Starting job '${params.name}' was interrupted by PowerShell extension shutdown.`
+							: `Starting job '${params.name}' was aborted.`,
+					);
 				}
 
-				const record: JobRecord = {
-					name: params.name,
-					pid: child.pid,
-					command: params.command,
-					cwd,
-					startedAt: Date.now(),
-					endedAt: null,
-					exitCode: null,
-					mergedPath,
-					stdoutPath,
-					stderrPath,
-					ownedLogPaths,
-					status: "running",
-					child,
-					trackingStopped: false,
-				};
-				jobs.set(params.name, record);
-				child.on("exit", (code) => void trackProcessGroupExit(record, code));
-				child.on("error", () => markJobExited(record));
 				child.unref();
 
 				return {
@@ -592,12 +663,27 @@ export default function powershellExtension(pi: ExtensionAPI) {
 					},
 				};
 			} catch (error) {
-				if (child?.pid && !childHasExited(child)) await terminateProcessTree(child);
-				await Promise.allSettled(ownedLogPaths.map((path) => rm(path, { force: true })));
+				try {
+					if (record) {
+						if (record.status === "running") await stopJob(record);
+						record.trackingStopped = true;
+						await removeJobFiles(record);
+						jobs.delete(record.name);
+					} else {
+						if (child?.pid && !childHasExited(child) && !(await terminateProcessTree(child))) {
+							throw new Error(`Could not stop the untracked process for job '${params.name}'.`);
+						}
+						await Promise.allSettled(ownedLogPaths.map((path) => rm(path, { force: true })));
+					}
+				} catch (cleanupError) {
+					throw new AggregateError([error, cleanupError], `Starting job '${params.name}' failed and cleanup was incomplete.`);
+				}
 				throw error;
 			} finally {
 				for (const fd of openedFds) closeSync(fd);
 				startingJobs.delete(params.name);
+				completeOperation();
+				startingJobOperations.delete(operation);
 			}
 		},
 	});
@@ -655,7 +741,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		name: "pwsh-stop-job",
 		label: "Stop PowerShell Job",
 		description:
-			"Stop an entire background PowerShell process tree. Uses taskkill /T /F on Windows; on macOS and Linux it sends SIGTERM, then SIGKILL after 3 seconds if the process group is still alive.",
+			"Stop a background PowerShell process tree. Uses taskkill /T /F on Windows while the root pwsh is alive; self-detached Windows descendants may escape tracking. On macOS and Linux it sends SIGTERM, then SIGKILL after 3 seconds if the process group is still alive.",
 		promptSnippet: "Stop a running pwsh background job.",
 		parameters: Type.Object({
 			name: Type.String({ description: "Job name to stop" }),

@@ -2,7 +2,7 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,7 +36,7 @@ const pi = {
 };
 
 const jiti = createJiti(import.meta.url);
-const { default: extension } = await jiti.import(join(repoRoot, "extensions", "powershell.ts"));
+const { default: extension, probePowerShell } = await jiti.import(join(repoRoot, "extensions", "powershell.ts"));
 extension(pi);
 
 const ctx = {
@@ -55,6 +55,12 @@ const scratchDir = await mkdtemp(join(tmpdir(), "pi-powershell-test-"));
 let fullOutputPath;
 
 try {
+	assert(await probePowerShell(shell), "PowerShell availability probe rejected the configured executable");
+	assert(
+		!(await probePowerShell(join(scratchDir, "definitely-missing-pwsh"))),
+		"PowerShell availability probe accepted a missing executable",
+	);
+
 	let streamingUpdates = 0;
 	const success = await foreground.execute(
 		"success",
@@ -75,6 +81,38 @@ try {
 	);
 	assert(successText.includes("warning-stream"), "stderr was not captured");
 	assert(streamingUpdates > 0, "streaming updates were not emitted");
+
+	const multiline = await foreground.execute(
+		"multiline",
+		{
+			command: `$value = @'
+line "double"
+line 'single' 🚀
+'@
+Write-Output $value`,
+		},
+		undefined,
+		undefined,
+		ctx,
+	);
+	assert(
+		multiline.content[0].text.includes('line "double"') && multiline.content[0].text.includes("line 'single' 🚀"),
+		"multiline here-string or quote handling failed",
+	);
+
+	let strictError = "";
+	try {
+		await foreground.execute(
+			"strict-error",
+			{ command: "$ErrorActionPreference = 'Stop'; Get-Item '/definitely-missing-powershell-test'; Write-Output unreachable" },
+			undefined,
+			undefined,
+			ctx,
+		);
+	} catch (error) {
+		strictError = String(error);
+	}
+	assert(strictError.includes("definitely-missing-powershell-test"), "strict PowerShell error handling was not observable");
 
 	let nonzeroError = "";
 	try {
@@ -128,6 +166,77 @@ try {
 	assert(fullOutputPath && existsSync(fullOutputPath), "full output was not spilled to a temporary file");
 	assert(large.content[0].text.includes("line-3000"), "truncated output did not retain the tail");
 
+	const unicodeCwd = join(scratchDir, "working directory 雪");
+	await mkdir(unicodeCwd);
+	const cwdJob = `cwd-${process.pid}`;
+	startedJobs.add(cwdJob);
+	await requiredTool("pwsh-start-job").execute(
+		"cwd-start",
+		{ name: cwdJob, command: "Write-Output (Get-Location).Path", workingDirectory: unicodeCwd },
+		undefined,
+		undefined,
+		ctx,
+	);
+	await waitForJob(cwdJob, "exited");
+	const cwdOutput = await requiredTool("pwsh-get-job-output").execute("cwd-output", { name: cwdJob });
+	assert(cwdOutput.content[0].text.includes(unicodeCwd), "background Unicode working directory was not preserved");
+	await removeJob(cwdJob);
+
+	let missingCwdError = "";
+	try {
+		await requiredTool("pwsh-start-job").execute(
+			"missing-cwd",
+			{ name: `missing-cwd-${process.pid}`, command: "Write-Output unreachable", workingDirectory: join(scratchDir, "missing") },
+			undefined,
+			undefined,
+			ctx,
+		);
+	} catch (error) {
+		missingCwdError = String(error);
+	}
+	assert(missingCwdError.length > 0, "background start accepted a nonexistent working directory");
+
+	const preAborted = new AbortController();
+	preAborted.abort();
+	let startAbortError = "";
+	try {
+		await requiredTool("pwsh-start-job").execute(
+			"pre-aborted-start",
+			{ name: `pre-aborted-${process.pid}`, command: "Write-Output unreachable" },
+			preAborted.signal,
+			undefined,
+			ctx,
+		);
+	} catch (error) {
+		startAbortError = String(error);
+	}
+	assert(startAbortError.includes("aborted"), "pre-aborted background start was not rejected");
+
+	const duplicateJob = `duplicate-${process.pid}`;
+	startedJobs.add(duplicateJob);
+	const duplicateStarts = await Promise.allSettled([
+		requiredTool("pwsh-start-job").execute(
+			"duplicate-first",
+			{ name: duplicateJob, command: "Start-Sleep -Milliseconds 300" },
+			undefined,
+			undefined,
+			ctx,
+		),
+		requiredTool("pwsh-start-job").execute(
+			"duplicate-second",
+			{ name: duplicateJob, command: "Start-Sleep -Milliseconds 300" },
+			undefined,
+			undefined,
+			ctx,
+		),
+	]);
+	assert(
+		duplicateStarts.filter(({ status }) => status === "fulfilled").length === 1 &&
+			duplicateStarts.filter(({ status }) => status === "rejected").length === 1,
+		"concurrent duplicate job starts were not serialized",
+	);
+	await removeJob(duplicateJob);
+
 	const completedJob = `complete-${process.pid}`;
 	startedJobs.add(completedJob);
 	await requiredTool("pwsh-start-job").execute(
@@ -174,6 +283,19 @@ try {
 	);
 	await removeJob(environmentJob);
 
+	const failedJob = `failed-${process.pid}`;
+	startedJobs.add(failedJob);
+	await requiredTool("pwsh-start-job").execute(
+		"failed-start",
+		{ name: failedJob, command: "Write-Output before-background-failure; exit 7" },
+		undefined,
+		undefined,
+		ctx,
+	);
+	const failedStatus = await waitForJob(failedJob, "exited");
+	assert(failedStatus.includes("Exit code: 7"), "background nonzero exit code was not retained");
+	await removeJob(failedJob);
+
 	const stoppedJob = `stop-${process.pid}`;
 	startedJobs.add(stoppedJob);
 	await requiredTool("pwsh-start-job").execute(
@@ -188,6 +310,26 @@ try {
 	const stoppedStatus = await requiredTool("pwsh-get-job").execute("stop-status", { name: stoppedJob });
 	assert(stoppedStatus.content[0].text.includes("Status: exited"), "stopped job remained running");
 	await removeJob(stoppedJob);
+
+	const directChildJob = `direct-child-${process.pid}`;
+	const quotedNode = process.execPath.replaceAll("'", "''");
+	startedJobs.add(directChildJob);
+	await requiredTool("pwsh-start-job").execute(
+		"direct-child-start",
+		{
+			name: directChildJob,
+			command: `& '${quotedNode}' -e 'console.log("child-pid=" + process.pid); setTimeout(() => {}, 30000)'`,
+		},
+		undefined,
+		undefined,
+		ctx,
+	);
+	const directChildOutput = await waitForOutputMatch(directChildJob, /child-pid=(\d+)/);
+	const directChildPid = Number(directChildOutput.match(/child-pid=(\d+)/)?.[1]);
+	assert(Number.isInteger(directChildPid), "could not capture the directly launched child process id");
+	await requiredTool("pwsh-stop-job").execute("direct-child-stop", { name: directChildJob });
+	await waitForProcessExit(directChildPid);
+	await removeJob(directChildJob);
 
 	if (process.platform !== "win32") {
 		const descendantJob = `descendant-${process.pid}`;
@@ -284,30 +426,65 @@ try {
 	);
 	const shutdownLog = shutdownStart.details.mergedPath;
 	await waitForOutput(shutdownJob, "shutdown-ready");
-	await handlers.get("session_shutdown")();
-	startedJobs.delete(shutdownJob);
+	const racingJob = `shutdown-race-${process.pid}`;
+	startedJobs.add(racingJob);
+	const racingStart = requiredTool("pwsh-start-job").execute(
+		"shutdown-race-start",
+		{ name: racingJob, command: "Write-Output should-not-survive; Start-Sleep -Seconds 30" },
+		undefined,
+		undefined,
+		ctx,
+	);
+	const shutdown = handlers.get("session_shutdown")();
+	const [racingResult, shutdownResult] = await Promise.allSettled([racingStart, shutdown]);
+	assert(racingResult.status === "rejected", "an in-flight job start survived extension shutdown");
+	assert(shutdownResult.status === "fulfilled", "extension shutdown failed while a job was starting");
 	assert(!existsSync(shutdownLog), "session shutdown did not delete its owned job log");
 	const emptyJobs = await requiredTool("pwsh-get-job").execute("after-shutdown", {});
 	assert(emptyJobs.content[0].text === "No active jobs.", "session shutdown did not clear tracked jobs");
+	startedJobs.delete(shutdownJob);
+	startedJobs.delete(racingJob);
+
+	await handlers.get("session_start")({}, ctx);
+	const restartedJob = `after-session-start-${process.pid}`;
+	startedJobs.add(restartedJob);
+	await requiredTool("pwsh-start-job").execute(
+		"after-session-start",
+		{ name: restartedJob, command: "Write-Output restarted" },
+		undefined,
+		undefined,
+		ctx,
+	);
+	await waitForJob(restartedJob, "exited");
+	await removeJob(restartedJob);
 
 	console.log(
 		JSON.stringify(
 			{
 				powershellVersion: version.stdout.trim(),
 				foreground: "passed",
+				availabilityProbe: "passed",
+				multilineQuoting: "passed",
+				strictErrors: "passed",
 				streamingUpdates,
 				nonzeroExit: "passed",
 				timeoutMs,
 				abort: "passed",
 				truncation: "passed",
 				backgroundComplete: "passed",
+				backgroundNonzeroExit: "passed",
+				backgroundWorkingDirectory: "passed",
+				backgroundStartValidation: "passed",
+				duplicateStart: "passed",
 				backgroundStop: "passed",
+				directChildStop: "passed",
 				descendantStop: process.platform === "win32" ? "not run on Windows" : "passed",
 				backgroundEnvironment: "passed",
 				separateStreams: "passed",
 				boundedBackgroundTail: "passed",
 				customLogPreserved: "passed",
-				sessionShutdown: "passed",
+				sessionShutdownRace: "passed",
+				sessionRestart: "passed",
 			},
 			null,
 			2,

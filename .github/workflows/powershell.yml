@@ -1,0 +1,34 @@
+name: PowerShell extension
+
+on:
+  push:
+    paths:
+      - ".github/workflows/powershell.yml"
+      - "extensions/powershell.ts"
+      - "scripts/test-powershell-extension.mjs"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+  pull_request:
+    paths:
+      - ".github/workflows/powershell.yml"
+      - "extensions/powershell.ts"
+      - "scripts/test-powershell-extension.mjs"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm run test:powershell
