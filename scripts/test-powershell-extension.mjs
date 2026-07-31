@@ -271,7 +271,11 @@ Write-Output $value`,
 		undefined,
 		ctx,
 	);
-	const environmentText = await waitForOutput(environmentJob, "powershell-test-session");
+	await waitForJob(environmentJob, "exited");
+	const environmentOutput = await requiredTool("pwsh-get-job-output").execute("environment-output", {
+		name: environmentJob,
+	});
+	const environmentText = environmentOutput.content[0].text;
 	assert(
 		environmentText.includes("powershell-test-session|") &&
 			environmentText.includes("powershell-test-session.jsonl|openai|powershell-test-model|medium"),
