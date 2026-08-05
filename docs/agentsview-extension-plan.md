@@ -182,7 +182,7 @@ Desired split:
 
 Current finding:
 
-- AgentsView's stable `session usage` API reports `total_output_tokens`, `peak_context_tokens`, `cost_usd`, models, and unpriced models.
+- AgentsView's `session usage` API reports `total_output_tokens`, `peak_context_tokens`, `cost`, models, and unpriced models. Since AgentsView 0.40, machine-readable costs use exact integer microdollar objects such as `{"cost":{"microdollars":2410000}}`; the extension also accepts the earlier numeric `cost_usd` shape for compatibility.
 - The local DB has message-level fields such as `token_usage`, `context_tokens`, and `output_tokens`, but those are currently associated with assistant turns and represent provider-level aggregate request usage, not an attribution split across system/user/tool/context components.
 - Pi session JSONL stores per-assistant-message usage including input, output, cache read/write, and cost, but not an explicit split of input tokens into system vs user vs tool context.
 

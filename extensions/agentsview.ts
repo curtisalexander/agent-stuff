@@ -11,6 +11,9 @@ const DEFAULT_TIMEOUT_MS = 8_000;
 
 type StatusMode = "compact" | "tokens" | "daily" | "visual" | "off";
 
+type Money = { microdollars: number };
+type MoneyValue = Money | number;
+
 type SessionUsage = {
 	session_id: string;
 	agent: string;
@@ -18,7 +21,9 @@ type SessionUsage = {
 	total_output_tokens: number;
 	peak_context_tokens: number;
 	has_token_data: boolean;
-	cost_usd: number;
+	cost?: Money;
+	/** AgentsView < 0.40 compatibility. */
+	cost_usd?: number;
 	has_cost: boolean;
 	models?: string[];
 	unpriced_models?: string[];
@@ -52,7 +57,7 @@ type DailyUsage = {
 		outputTokens: number;
 		cacheCreationTokens: number;
 		cacheReadTokens: number;
-		totalCost: number;
+		totalCost: MoneyValue;
 		modelsUsed?: string[];
 		modelBreakdowns?: Array<{
 			modelName: string;
@@ -60,7 +65,7 @@ type DailyUsage = {
 			outputTokens: number;
 			cacheCreationTokens: number;
 			cacheReadTokens: number;
-			cost: number;
+			cost: MoneyValue;
 		}>;
 	}>;
 	totals?: {
@@ -68,8 +73,8 @@ type DailyUsage = {
 		outputTokens: number;
 		cacheCreationTokens: number;
 		cacheReadTokens: number;
-		totalCost: number;
-		cacheSavings?: number;
+		totalCost: MoneyValue;
+		cacheSavings?: MoneyValue;
 	};
 	sessionCounts?: {
 		total: number;
@@ -394,12 +399,12 @@ function formatStatus() {
 	}
 
 	if (state.mode === "tokens") {
-		return `AV ${money(session?.cost_usd)} · out ${compact(session?.total_output_tokens)} · peak ${compact(session?.peak_context_tokens)} ctx`;
+		return `AV ${money(sessionCost(session))} · out ${compact(session?.total_output_tokens)} · peak ${compact(session?.peak_context_tokens)} ctx`;
 	}
 
 	const warning = session?.has_cost === false ? " · unpriced" : "";
 	const health = state.sessionDetail?.health_grade ? ` · ${state.sessionDetail.health_grade}` : "";
-	return `AV ${money(session?.cost_usd)} sess · ${money(daily?.totalCost)} today · ${compact(session?.peak_context_tokens)} ctx${health}${warning}`;
+	return `AV ${money(sessionCost(session))} sess · ${money(daily?.totalCost)} today · ${compact(session?.peak_context_tokens)} ctx${health}${warning}`;
 }
 
 function summaryText() {
@@ -414,7 +419,7 @@ function detailLines() {
 		"AgentsView current session",
 		`Session: ${usage.session_id}`,
 		`Project: ${usage.project}`,
-		`Cost: ${usage.has_cost ? money(usage.cost_usd) : "n/a"}`,
+		`Cost: ${usage.has_cost ? money(sessionCost(usage)) : "n/a"}`,
 		`Output tokens: ${usage.total_output_tokens.toLocaleString()}`,
 		`Peak context: ${usage.peak_context_tokens.toLocaleString()}`,
 		`Models: ${(usage.models ?? []).join(", ") || "n/a"}`,
@@ -613,9 +618,14 @@ function nextMode(mode: StatusMode): StatusMode {
 	return "compact";
 }
 
-function money(value: number | undefined) {
-	if (value === undefined || Number.isNaN(value)) return "$0.00";
-	return `$${value.toFixed(value < 1 ? 3 : 2)}`;
+function sessionCost(usage: SessionUsage | undefined) {
+	return usage?.cost ?? usage?.cost_usd;
+}
+
+function money(value: MoneyValue | undefined) {
+	const dollars = typeof value === "number" ? value : value?.microdollars !== undefined ? value.microdollars / 1_000_000 : undefined;
+	if (dollars === undefined || !Number.isFinite(dollars)) return "$0.00";
+	return `$${dollars.toFixed(dollars < 1 ? 3 : 2)}`;
 }
 
 function compact(value: number | undefined) {
