@@ -143,7 +143,7 @@ npm run check
 npm run test:powershell
 ```
 
-`test:powershell` is a deterministic integration test that loads the extension, invokes real PowerShell without an LLM, and covers executable probing, multiline commands and quoting, strict errors, merged and separate stdout/stderr, streaming, Pi session environment variables, foreground and background nonzero exits, timeout, abort, large foreground and background output truncation, Unicode working directories, background start validation and duplicate prevention, background completion/stop, Unix descendant cleanup, custom-log preservation, and shutdown racing an in-flight start.
+`test:powershell` is a deterministic integration test that loads the extension, invokes real PowerShell without an LLM, and covers executable probing, multiline commands and quoting, BOM-less UTF-8 native pipeline input, strict errors, merged and separate stdout/stderr, streaming, Pi session environment variables, foreground and background nonzero exits, timeout, abort, large foreground and background output truncation, Unicode working directories, background start validation and duplicate prevention, background completion/stop, Unix descendant cleanup, custom-log preservation, and shutdown racing an in-flight start.
 
 Windows process containment must also be tested on a native Windows runner. See `docs/powershell-hardening.md` for the platform-specific verification checklist and the condition that would justify a future Windows Job Object supervisor.
 

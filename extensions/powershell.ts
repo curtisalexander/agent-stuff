@@ -28,8 +28,8 @@ const EXIT_STDIO_GRACE_MS = 100;
 const POWERSHELL_PROBE_TIMEOUT_MS = 5_000;
 
 const UTF8_PREFIX =
-	"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " +
-	"$OutputEncoding = [System.Text.Encoding]::UTF8\n";
+	"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); " +
+	"$OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n";
 
 const INSTANCE_ID = `${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 let jobsDirPromise: Promise<string> | null = null;

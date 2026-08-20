@@ -103,6 +103,23 @@ Write-Output $value`,
 		"multiline here-string or quote handling failed",
 	);
 
+	const quotedNode = process.execPath.replaceAll("'", "''");
+	const nativePipeline = await foreground.execute(
+		"native-pipeline",
+		{
+			command: `'yes-雪-🚀' | & '${quotedNode}' -e 'process.stdin.on("data", data => console.log(data.toString("hex")))'`,
+		},
+		undefined,
+		undefined,
+		ctx,
+	);
+	const nativePipelineHex = nativePipeline.content[0].text.trim();
+	assert(!nativePipelineHex.startsWith("efbbbf"), "PowerShell added a UTF-8 BOM to native pipeline input");
+	assert(
+		nativePipelineHex.startsWith(Buffer.from("yes-雪-🚀", "utf8").toString("hex")),
+		"PowerShell did not pass UTF-8 text through a native pipeline",
+	);
+
 	let strictError = "";
 	try {
 		await foreground.execute(
@@ -315,7 +332,6 @@ Write-Output $value`,
 	await removeJob(stoppedJob);
 
 	const directChildJob = `direct-child-${process.pid}`;
-	const quotedNode = process.execPath.replaceAll("'", "''");
 	startedJobs.add(directChildJob);
 	await requiredTool("pwsh-start-job").execute(
 		"direct-child-start",
@@ -468,6 +484,7 @@ Write-Output $value`,
 				foreground: "passed",
 				availabilityProbe: "passed",
 				multilineQuoting: "passed",
+				nativePipelineUtf8: "passed",
 				strictErrors: "passed",
 				streamingUpdates,
 				nonzeroExit: "passed",
