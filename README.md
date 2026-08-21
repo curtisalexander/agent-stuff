@@ -117,7 +117,8 @@ Adds a `powershell` tool plus a set of background-job tools (`pwsh-start-job`,
 - process-tree cleanup on timeout, cancellation, job removal, and Pi session shutdown
 - streaming partial output to the TUI as commands run
 - cross-platform PowerShell Core usage on macOS, Linux, and Windows
-- automatically preferring PowerShell over `bash` on Windows after verifying that PowerShell 7 can launch
+- automatically preferring the `powershell` tool over `bash` on Windows after verifying that PowerShell 7 can launch
+- routing user-entered `!` and `!!` commands through PowerShell on Windows, with Bash fallback when PowerShell 7 is unavailable
 
 The job-tool API shape is adapted from
 [`@marcfargas/pi-powershell`](https://github.com/marcfargas/pi-powershell) (MIT).
@@ -143,7 +144,7 @@ npm run check
 npm run test:powershell
 ```
 
-`test:powershell` is a deterministic integration test that loads the extension, invokes real PowerShell without an LLM, and covers executable probing, multiline commands and quoting, BOM-less UTF-8 native pipeline input, strict errors, merged and separate stdout/stderr, streaming, Pi session environment variables, foreground and background nonzero exits, timeout, abort, large foreground and background output truncation, Unicode working directories, background start validation and duplicate prevention, background completion/stop, Unix descendant cleanup, custom-log preservation, and shutdown racing an in-flight start.
+`test:powershell` is a deterministic integration test that loads the extension, invokes real PowerShell without an LLM, and covers executable probing, user `!` command routing, multiline commands and quoting, BOM-less UTF-8 native pipeline input, strict errors, merged and separate stdout/stderr, streaming, Pi session environment variables, foreground and background nonzero exits, timeout, abort, large foreground and background output truncation, Unicode working directories, background start validation and duplicate prevention, background completion/stop, Unix descendant cleanup, custom-log preservation, and shutdown racing an in-flight start.
 
 Windows process containment must also be tested on a native Windows runner. See `docs/powershell-hardening.md` for the platform-specific verification checklist and the condition that would justify a future Windows Job Object supervisor.
 

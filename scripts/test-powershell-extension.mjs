@@ -64,6 +64,27 @@ try {
 		"PowerShell availability probe accepted a missing executable",
 	);
 
+	const userBashHandler = handlers.get("user_bash");
+	assert(userBashHandler, "extension did not register the user_bash handler");
+	const userBashResult = await userBashHandler(
+		{ type: "user_bash", command: "Write-Output user-bash-powershell", excludeFromContext: false, cwd: repoRoot },
+		ctx,
+	);
+	if (process.platform === "win32") {
+		assert(userBashResult?.operations, "user ! commands were not routed to PowerShell on Windows");
+		let userBashOutput = "";
+		const routedResult = await userBashResult.operations.exec("Write-Output user-bash-powershell", repoRoot, {
+			onData: (data) => {
+				userBashOutput += data.toString("utf8");
+			},
+			env: process.env,
+		});
+		assert(routedResult.exitCode === 0, "PowerShell execution for a user ! command failed");
+		assert(userBashOutput.includes("user-bash-powershell"), "user ! command did not produce PowerShell output");
+	} else {
+		assert(userBashResult === undefined, "user ! commands should retain Pi's default shell outside Windows");
+	}
+
 	let streamingUpdates = 0;
 	const success = await foreground.execute(
 		"success",
@@ -483,6 +504,7 @@ Write-Output $value`,
 				powershellVersion: version.stdout.trim(),
 				foreground: "passed",
 				availabilityProbe: "passed",
+				userBashRouting: process.platform === "win32" ? "PowerShell passed" : "default shell preserved",
 				multilineQuoting: "passed",
 				nativePipelineUtf8: "passed",
 				strictErrors: "passed",

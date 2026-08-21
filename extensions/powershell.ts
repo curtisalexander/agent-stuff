@@ -469,6 +469,13 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		};
 	});
 
+	pi.on("user_bash", async () => {
+		if (!IS_WINDOWS) return;
+		powershellAvailabilityPromise ??= probePowerShell();
+		if (!(await powershellAvailabilityPromise)) return;
+		return { operations: powershellOperations };
+	});
+
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
 		await Promise.allSettled(Array.from(startingJobOperations));
