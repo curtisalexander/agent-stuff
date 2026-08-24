@@ -118,7 +118,8 @@ Adds a `powershell` tool plus a set of background-job tools (`pwsh-start-job`,
 - streaming partial output to the TUI as commands run
 - cross-platform PowerShell Core usage on macOS, Linux, and Windows
 - automatically preferring the `powershell` tool over `bash` on Windows after verifying that PowerShell 7 can launch
-- routing user-entered `!` and `!!` commands through PowerShell on Windows, with Bash fallback when PowerShell 7 is unavailable
+- routing user-entered `!` and `!!` commands through PowerShell on Windows, with unavailable PowerShell tools disabled and Bash left unchanged when PowerShell 7 cannot launch
+- per-job environment-variable overrides and bounded cursor-based output consumption for long-running jobs
 
 The job-tool API shape is adapted from
 [`@marcfargas/pi-powershell`](https://github.com/marcfargas/pi-powershell) (MIT).
@@ -126,7 +127,9 @@ Implementation is Node-native rather than PowerShell's `Start-Process`.
 
 Invoke long-running background programs directly, for example `npm run dev` or `dotnet watch`. Do not wrap them in `Start-Process`, `Start-Job`, a trailing background operator such as `command &`, or another self-detaching/backgrounding construct. PowerShell's `&` call operator is still appropriate for synchronous invocation. On Windows, `taskkill /T /F` can clean up descendants while the root `pwsh` remains alive, but Windows does not provide a durable process-tree handle through Node's standard child-process API after that root exits.
 
-Jobs survive tool calls, not extension-runtime replacement. Pi `/reload`, `/new`, `/resume`, `/fork`, and quit trigger session shutdown, which stops tracked jobs and deletes extension-owned logs.
+Jobs survive tool calls, not extension-runtime replacement. Pi `/reload`, `/new`, `/resume`, `/fork`, and quit trigger session shutdown, which stops tracked jobs and deletes the extension-owned log directory. On Unix, that directory and its files are created with modes `0700` and `0600`, respectively. Caller-specified log files remain caller-owned and are preserved.
+
+Use `pwsh-start-job`'s `env` object for per-job environment variables. `pwsh-get-job-output` returns a bounded tail by default; pass `cursor: {}` to read from the beginning, then pass its returned `nextCursor` to consume subsequent chunks without gaps. Pass `full: true` only when raw log paths are needed.
 
 PowerShell non-terminating errors do not always produce a failing process exit code. For failure-sensitive automation, opt in explicitly as appropriate:
 
@@ -144,9 +147,9 @@ npm run check
 npm run test:powershell
 ```
 
-`test:powershell` is a deterministic integration test that loads the extension, invokes real PowerShell without an LLM, and covers executable probing, user `!` command routing, multiline commands and quoting, BOM-less UTF-8 native pipeline input, strict errors, merged and separate stdout/stderr, streaming, Pi session environment variables, foreground and background nonzero exits, timeout, abort, large foreground and background output truncation, Unicode working directories, background start validation and duplicate prevention, background completion/stop, Unix descendant cleanup, custom-log preservation, and shutdown racing an in-flight start.
+`test:powershell` is a deterministic integration test that loads the extension, invokes real PowerShell without an LLM, and covers executable probing, Windows tool activation and unavailable-PowerShell fallback, user `!` command routing, multiline commands and quoting, BOM-less UTF-8 native pipeline input, strict errors, merged and separate stdout/stderr, streaming, Pi session and per-job environment variables, foreground and background nonzero exits, timeout/abort descendant cleanup, large-output tail and cursor reads, full-path opt-in, private log permissions, Unicode working directories, background start validation and duplicate prevention, background completion/stop, Unix descendant cleanup, custom-log preservation, shutdown racing an in-flight start, and job-directory cleanup across session restart.
 
-Windows process containment must also be tested on a native Windows runner. See `docs/powershell-hardening.md` for the platform-specific verification checklist and the condition that would justify a future Windows Job Object supervisor.
+The PowerShell workflow runs this suite on both Ubuntu and a native Windows runner. See `docs/powershell-hardening.md` for the platform-specific verification checklist and the condition that would justify a future Windows Job Object supervisor.
 
 After configuring a model in Pi, run the model-driven integration test with:
 

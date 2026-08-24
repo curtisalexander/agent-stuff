@@ -2,14 +2,19 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
 
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const scriptPath = fileURLToPath(import.meta.url);
+const repoRoot = resolve(dirname(scriptPath), "..");
 const shell = process.env.POWERSHELL_BIN || "pwsh";
+if (process.argv.includes("--verify-unavailable-windows")) {
+	await verifyUnavailableWindowsFallback();
+	process.exit(0);
+}
 const version = spawnSync(shell, ["-NoLogo", "-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"], {
 	encoding: "utf8",
 });
@@ -19,6 +24,8 @@ if (version.error || version.status !== 0) {
 
 const tools = new Map();
 const handlers = new Map();
+const notifications = [];
+let activeToolOverride = null;
 const pi = {
 	on(event, handler) {
 		handlers.set(event, handler);
@@ -27,12 +34,14 @@ const pi = {
 		tools.set(tool.name, tool);
 	},
 	getActiveTools() {
-		return ["bash"];
+		return activeToolOverride ?? ["bash", ...tools.keys()];
 	},
 	getAllTools() {
 		return Array.from(tools.values(), ({ name }) => ({ name }));
 	},
-	setActiveTools() {},
+	setActiveTools(names) {
+		activeToolOverride = [...names];
+	},
 };
 
 const jiti = createJiti(import.meta.url);
@@ -48,7 +57,9 @@ const ctx = {
 		getSessionFile: () => join(repoRoot, "powershell-test-session.jsonl"),
 	},
 	ui: {
-		notify() {},
+		notify(message, level) {
+			notifications.push({ message, level });
+		},
 	},
 };
 
@@ -63,6 +74,29 @@ try {
 		!(await probePowerShell(join(scratchDir, "definitely-missing-pwsh"))),
 		"PowerShell availability probe accepted a missing executable",
 	);
+	await handlers.get("session_start")({}, ctx);
+	if (process.platform === "win32") {
+		assert(activeToolOverride?.includes("powershell"), "session start did not activate powershell on Windows");
+		assert(!activeToolOverride?.includes("bash"), "session start did not deactivate bash on Windows");
+		assert(
+			notifications.some(({ message, level }) => level === "info" && message.includes("enabled powershell")),
+			"session start did not report PowerShell activation",
+		);
+		const beforeAgentResult = await handlers.get("before_agent_start")({ systemPrompt: "base prompt" }, ctx);
+		assert(beforeAgentResult?.systemPrompt.includes("Prefer the powershell tool"), "Windows system prompt guidance was missing");
+		const unavailable = spawnSync(process.execPath, [scriptPath, "--verify-unavailable-windows"], {
+			cwd: repoRoot,
+			env: { ...process.env, POWERSHELL_BIN: join(scratchDir, "definitely-missing-pwsh-child") },
+			encoding: "utf8",
+			timeout: 15_000,
+		});
+		assert(
+			unavailable.status === 0,
+			`PowerShell-unavailable fallback failed: ${unavailable.error?.message ?? unavailable.stderr ?? unavailable.stdout}`,
+		);
+	} else {
+		assert(activeToolOverride === null, "session start changed active tools outside Windows");
+	}
 
 	const userBashHandler = handlers.get("user_bash");
 	assert(userBashHandler, "extension did not register the user_bash handler");
@@ -168,7 +202,10 @@ Write-Output $value`,
 	try {
 		await foreground.execute(
 			"timeout",
-			{ command: "Start-Sleep -Seconds 10", timeout: 0.25 },
+			{
+				command: `& '${quotedNode}' -e 'console.log("timeout-child=" + process.pid); setTimeout(() => {}, 30000)'`,
+				timeout: 1,
+			},
 			undefined,
 			undefined,
 			ctx,
@@ -178,14 +215,17 @@ Write-Output $value`,
 	}
 	const timeoutMs = Date.now() - timeoutStartedAt;
 	assert(timeoutError.includes("timed out") && timeoutMs < 7_000, "timeout or process-tree termination failed");
+	const timeoutChildPid = Number(timeoutError.match(/timeout-child=(\d+)/)?.[1]);
+	assert(Number.isInteger(timeoutChildPid), "foreground timeout did not capture its descendant process id");
+	await waitForProcessExit(timeoutChildPid);
 
 	const abortController = new AbortController();
-	setTimeout(() => abortController.abort(), 250);
+	setTimeout(() => abortController.abort(), 1_000);
 	let abortError = "";
 	try {
 		await foreground.execute(
 			"abort",
-			{ command: "Start-Sleep -Seconds 10" },
+			{ command: `& '${quotedNode}' -e 'console.log("abort-child=" + process.pid); setTimeout(() => {}, 30000)'` },
 			abortController.signal,
 			undefined,
 			ctx,
@@ -194,6 +234,9 @@ Write-Output $value`,
 		abortError = String(error);
 	}
 	assert(abortError.includes("aborted"), "abort handling failed");
+	const abortChildPid = Number(abortError.match(/abort-child=(\d+)/)?.[1]);
+	assert(Number.isInteger(abortChildPid), "foreground abort did not capture its descendant process id");
+	await waitForProcessExit(abortChildPid);
 
 	const large = await foreground.execute(
 		"large",
@@ -280,7 +323,7 @@ Write-Output $value`,
 
 	const completedJob = `complete-${process.pid}`;
 	startedJobs.add(completedJob);
-	await requiredTool("pwsh-start-job").execute(
+	const completedStart = await requiredTool("pwsh-start-job").execute(
 		"job-start",
 		{
 			name: completedJob,
@@ -290,6 +333,12 @@ Write-Output $value`,
 		undefined,
 		ctx,
 	);
+	if (process.platform !== "win32") {
+		const directoryMode = (await stat(dirname(completedStart.details.mergedPath))).mode & 0o777;
+		const logMode = (await stat(completedStart.details.mergedPath)).mode & 0o777;
+		assert(directoryMode === 0o700, `owned log directory mode was ${directoryMode.toString(8)}, expected 700`);
+		assert(logMode === 0o600, `owned log mode was ${logMode.toString(8)}, expected 600`);
+	}
 	const completedStatus = await waitForJob(completedJob, "exited");
 	const completedOutput = await requiredTool("pwsh-get-job-output").execute(
 		"job-output",
@@ -297,6 +346,20 @@ Write-Output $value`,
 	);
 	assert(completedStatus.includes("Exit code: 0"), "completed background job had the wrong status");
 	assert(completedOutput.content[0].text.includes("job-finished"), "background job output was incomplete");
+	assert(
+		!completedOutput.content[0].text.includes(completedStart.details.mergedPath) &&
+			completedOutput.details.mergedPath === undefined,
+		"default output unexpectedly exposed the full log path",
+	);
+	const completedFullOutput = await requiredTool("pwsh-get-job-output").execute("job-full-output", {
+		name: completedJob,
+		full: true,
+	});
+	assert(
+		completedFullOutput.content[0].text.includes(completedStart.details.mergedPath) &&
+			completedFullOutput.details.mergedPath === completedStart.details.mergedPath,
+		"full output did not expose the full log path",
+	);
 	await removeJob(completedJob);
 
 	const environmentJob = `environment-${process.pid}`;
@@ -306,7 +369,8 @@ Write-Output $value`,
 		{
 			name: environmentJob,
 			command:
-				'Write-Output "$env:PI_SESSION_ID|$env:PI_SESSION_FILE|$env:PI_PROVIDER|$env:PI_MODEL|$env:PI_REASONING_LEVEL"',
+				'Write-Output "$env:PI_SESSION_ID|$env:PI_SESSION_FILE|$env:PI_PROVIDER|$env:PI_MODEL|$env:PI_REASONING_LEVEL|$env:POWERSHELL_EXTENSION_TEST"',
+			env: { POWERSHELL_EXTENSION_TEST: "job-env-雪" },
 		},
 		undefined,
 		undefined,
@@ -319,7 +383,7 @@ Write-Output $value`,
 	const environmentText = environmentOutput.content[0].text;
 	assert(
 		environmentText.includes("powershell-test-session|") &&
-			environmentText.includes("powershell-test-session.jsonl|openai|powershell-test-model|medium"),
+			environmentText.includes("powershell-test-session.jsonl|openai|powershell-test-model|medium|job-env-雪"),
 		`background PI environment was incomplete:\n${environmentText}`,
 	);
 	await removeJob(environmentJob);
@@ -437,13 +501,24 @@ Write-Output $value`,
 			separateOutput.content[0].text.includes("stderr ("),
 		"separate stdout/stderr capture failed",
 	);
+	const separateCursorOutput = await requiredTool("pwsh-get-job-output").execute("streams-cursor-output", {
+		name: separateStreamsJob,
+		cursor: {},
+	});
+	assert(
+		separateCursorOutput.content[0].text.includes("stdout-only") &&
+			separateCursorOutput.content[0].text.includes("stderr-only") &&
+			separateCursorOutput.details.nextCursor.stdout > 0 &&
+			separateCursorOutput.details.nextCursor.stderr > 0,
+		"separate stdout/stderr cursor reads failed",
+	);
 	await removeJob(separateStreamsJob);
 
 	const largeJob = `large-job-${process.pid}`;
 	startedJobs.add(largeJob);
 	await requiredTool("pwsh-start-job").execute(
 		"large-job-start",
-		{ name: largeJob, command: '1..20000 | ForEach-Object { "background-line-$_" }; Write-Output "tail-🚀"' },
+		{ name: largeJob, command: '1..20000 | ForEach-Object { "background-line-$_-雪" }; Write-Output "tail-🚀"' },
 		undefined,
 		undefined,
 		ctx,
@@ -453,6 +528,21 @@ Write-Output $value`,
 	assert(largeJobOutput.content[0].text.includes("truncated=yes"), "large background output was not truncated");
 	assert(largeJobOutput.content[0].text.includes("tail-🚀"), "large background output did not preserve its UTF-8 tail");
 	assert(largeJobOutput.content[0].text.length < 60_000, "large background output retrieval was not bounded");
+	let cursor = {};
+	let incrementalOutput = "";
+	let cursorChunks = 0;
+	for (; cursorChunks < 20; cursorChunks++) {
+		const chunk = await requiredTool("pwsh-get-job-output").execute("large-job-cursor", { name: largeJob, cursor });
+		incrementalOutput += chunk.content[0].text;
+		const nextCursor = chunk.details.nextCursor;
+		assert(nextCursor.merged > (cursor.merged ?? -1), "incremental output cursor did not advance");
+		cursor = nextCursor;
+		if (!chunk.details.hasMore.merged) break;
+	}
+	assert(cursorChunks < 20, "incremental output did not reach the end of the log");
+	assert(incrementalOutput.includes("background-line-1"), "incremental output missed the beginning of the log");
+	assert(incrementalOutput.includes("tail-🚀"), "incremental output missed the UTF-8 tail of the log");
+	assert(!incrementalOutput.includes("�"), "incremental output split a UTF-8 character");
 	await removeJob(largeJob);
 
 	const shutdownJob = `shutdown-${process.pid}`;
@@ -480,6 +570,7 @@ Write-Output $value`,
 	assert(racingResult.status === "rejected", "an in-flight job start survived extension shutdown");
 	assert(shutdownResult.status === "fulfilled", "extension shutdown failed while a job was starting");
 	assert(!existsSync(shutdownLog), "session shutdown did not delete its owned job log");
+	assert(!existsSync(dirname(shutdownLog)), "session shutdown did not delete its owned job log directory");
 	const emptyJobs = await requiredTool("pwsh-get-job").execute("after-shutdown", {});
 	assert(emptyJobs.content[0].text === "No active jobs.", "session shutdown did not clear tracked jobs");
 	startedJobs.delete(shutdownJob);
@@ -488,7 +579,7 @@ Write-Output $value`,
 	await handlers.get("session_start")({}, ctx);
 	const restartedJob = `after-session-start-${process.pid}`;
 	startedJobs.add(restartedJob);
-	await requiredTool("pwsh-start-job").execute(
+	const restartedStart = await requiredTool("pwsh-start-job").execute(
 		"after-session-start",
 		{ name: restartedJob, command: "Write-Output restarted" },
 		undefined,
@@ -497,6 +588,8 @@ Write-Output $value`,
 	);
 	await waitForJob(restartedJob, "exited");
 	await removeJob(restartedJob);
+	await handlers.get("session_shutdown")();
+	assert(!existsSync(dirname(restartedStart.details.mergedPath)), "restarted session log directory survived shutdown");
 
 	console.log(
 		JSON.stringify(
@@ -504,6 +597,8 @@ Write-Output $value`,
 				powershellVersion: version.stdout.trim(),
 				foreground: "passed",
 				availabilityProbe: "passed",
+				toolActivation: process.platform === "win32" ? "passed" : "Windows-only",
+				unavailableFallback: process.platform === "win32" ? "passed" : "Windows-only",
 				userBashRouting: process.platform === "win32" ? "PowerShell passed" : "default shell preserved",
 				multilineQuoting: "passed",
 				nativePipelineUtf8: "passed",
@@ -512,6 +607,7 @@ Write-Output $value`,
 				nonzeroExit: "passed",
 				timeoutMs,
 				abort: "passed",
+				foregroundDescendantCleanup: "passed",
 				truncation: "passed",
 				backgroundComplete: "passed",
 				backgroundNonzeroExit: "passed",
@@ -522,10 +618,15 @@ Write-Output $value`,
 				directChildStop: "passed",
 				descendantStop: process.platform === "win32" ? "not run on Windows" : "passed",
 				backgroundEnvironment: "passed",
+				backgroundEnvironmentOverride: "passed",
 				separateStreams: "passed",
 				boundedBackgroundTail: "passed",
+				incrementalBackgroundOutput: "passed",
+				fullLogPathOptIn: "passed",
+				privateOwnedLogs: process.platform === "win32" ? "not applicable" : "passed",
 				customLogPreserved: "passed",
 				sessionShutdownRace: "passed",
+				jobDirectoryCleanup: "passed",
 				sessionRestart: "passed",
 			},
 			null,
@@ -536,8 +637,65 @@ Write-Output $value`,
 	for (const name of startedJobs) {
 		await removeJob(name).catch(() => undefined);
 	}
+	await handlers.get("session_shutdown")().catch(() => undefined);
 	if (fullOutputPath) await rm(fullOutputPath, { force: true }).catch(() => undefined);
 	await rm(scratchDir, { recursive: true, force: true });
+}
+
+async function verifyUnavailableWindowsFallback() {
+	assert(process.platform === "win32", "PowerShell-unavailable fallback mode is Windows-only");
+	const localTools = new Map();
+	const localHandlers = new Map();
+	const localNotifications = [];
+	let localActiveTools = null;
+	const localPi = {
+		on(event, handler) {
+			localHandlers.set(event, handler);
+		},
+		registerTool(tool) {
+			localTools.set(tool.name, tool);
+		},
+		getActiveTools() {
+			return localActiveTools ?? ["bash", ...localTools.keys()];
+		},
+		getAllTools() {
+			return Array.from(localTools.values(), ({ name }) => ({ name }));
+		},
+		setActiveTools(names) {
+			localActiveTools = [...names];
+		},
+	};
+	const localJiti = createJiti(import.meta.url);
+	const { default: localExtension } = await localJiti.import(join(repoRoot, "extensions", "powershell.ts"));
+	localExtension(localPi);
+	const localCtx = {
+		cwd: repoRoot,
+		model: undefined,
+		thinkingLevel: undefined,
+		sessionManager: { getSessionId: () => undefined, getSessionFile: () => undefined },
+		ui: {
+			notify(message, level) {
+				localNotifications.push({ message, level });
+			},
+		},
+	};
+	await localHandlers.get("session_start")({}, localCtx);
+	assert(localActiveTools?.includes("bash"), "bash was not preserved when PowerShell was unavailable");
+	assert(
+		!localActiveTools?.some((name) => name === "powershell" || name.startsWith("pwsh-")),
+		"unavailable PowerShell tools remained active",
+	);
+	assert(
+		localNotifications.some(({ message, level }) => level === "warning" && message.includes("PowerShell tools were disabled")),
+		"PowerShell-unavailable warning was missing",
+	);
+	const beforeAgentResult = await localHandlers.get("before_agent_start")({ systemPrompt: "base prompt" }, localCtx);
+	assert(beforeAgentResult === undefined, "unavailable PowerShell added Windows prompt guidance");
+	const userBashResult = await localHandlers.get("user_bash")(
+		{ type: "user_bash", command: "echo fallback", excludeFromContext: false, cwd: repoRoot },
+		localCtx,
+	);
+	assert(userBashResult === undefined, "unavailable PowerShell intercepted a user shell command");
 }
 
 function requiredTool(name) {

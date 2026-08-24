@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/workflows/powershell.yml"
       - "extensions/powershell.ts"
+      - "scripts/install-powershell-linux.sh"
       - "scripts/test-powershell-extension.mjs"
       - "package.json"
       - "package-lock.json"
@@ -13,6 +14,7 @@ on:
     paths:
       - ".github/workflows/powershell.yml"
       - "extensions/powershell.ts"
+      - "scripts/install-powershell-linux.sh"
       - "scripts/test-powershell-extension.mjs"
       - "package.json"
       - "package-lock.json"
@@ -20,9 +22,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  windows:
-    runs-on: windows-latest
-    timeout-minutes: 10
+  integration:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -30,5 +37,10 @@ jobs:
           node-version: 22.19.0
           cache: npm
       - run: npm ci
+      - name: Install PowerShell on Linux
+        if: runner.os == 'Linux'
+        run: |
+          npm run setup:powershell
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: npm run check
       - run: npm run test:powershell

@@ -15,8 +15,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawn, type ChildProcess } from "node:child_process";
-import { closeSync, openSync } from "node:fs";
-import { access, mkdir, open, rm } from "node:fs/promises";
+import { chmodSync, closeSync, openSync } from "node:fs";
+import { access, chmod, mkdir, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
@@ -38,9 +38,19 @@ let powershellAvailabilityPromise: Promise<boolean> | null = null;
 async function getJobsDir(): Promise<string> {
 	if (!jobsDirPromise) {
 		const dir = join(tmpdir(), `pi-powershell-jobs-${INSTANCE_ID}`);
-		jobsDirPromise = mkdir(dir, { recursive: true }).then(() => dir);
+		jobsDirPromise = mkdir(dir, { recursive: true, mode: 0o700 })
+			.then(() => chmod(dir, 0o700))
+			.then(() => dir);
 	}
 	return jobsDirPromise;
+}
+
+async function removeJobsDir(): Promise<void> {
+	const currentPromise = jobsDirPromise;
+	if (!currentPromise) return;
+	const dir = await currentPromise;
+	await rm(dir, { recursive: true, force: true });
+	if (jobsDirPromise === currentPromise) jobsDirPromise = null;
 }
 
 function resolveWorkingDirectory(cwd: string, inputCwd?: string): string {
@@ -382,6 +392,62 @@ async function readJobFile(path: string, maxLines: number, maxBytes: number) {
 	}
 }
 
+function completeUtf8PrefixLength(buffer: Buffer): number {
+	if (buffer.length === 0) return 0;
+	let lead = buffer.length - 1;
+	while (lead >= 0 && (buffer[lead] & 0xc0) === 0x80) lead--;
+	if (lead < 0) return 0;
+	const byte = buffer[lead];
+	const expectedLength = byte < 0x80 ? 1 : byte < 0xe0 ? 2 : byte < 0xf0 ? 3 : byte < 0xf8 ? 4 : 1;
+	return buffer.length - lead < expectedLength ? lead : buffer.length;
+}
+
+async function readJobFileFromCursor(path: string, offset: number, maxLines: number, maxBytes: number) {
+	let file;
+	try {
+		file = await open(path, "r");
+		const { size } = await file.stat();
+		const requestedOffset = Math.min(offset, size);
+		const buffer = Buffer.alloc(Math.min(size - requestedOffset, maxBytes + 3));
+		let bytesRead = 0;
+		while (bytesRead < buffer.length) {
+			const result = await file.read(buffer, bytesRead, buffer.length - bytesRead, requestedOffset + bytesRead);
+			if (result.bytesRead === 0) break;
+			bytesRead += result.bytesRead;
+		}
+		let utf8Start = 0;
+		while (utf8Start < bytesRead && (buffer[utf8Start] & 0xc0) === 0x80) utf8Start++;
+		const candidate = buffer.subarray(utf8Start, Math.min(bytesRead, utf8Start + maxBytes));
+		const completeLength = completeUtf8PrefixLength(candidate);
+		let content = candidate.subarray(0, completeLength).toString("utf8");
+		let newlineCount = 0;
+		for (let index = 0; index < content.length; index++) {
+			if (content.charCodeAt(index) !== 10) continue;
+			newlineCount++;
+			if (newlineCount === maxLines) {
+				content = content.slice(0, index + 1);
+				break;
+			}
+		}
+		const startOffset = requestedOffset + utf8Start;
+		const nextOffset = startOffset + Buffer.byteLength(content);
+		return {
+			content,
+			startOffset,
+			nextOffset,
+			totalBytes: size,
+			outputBytes: nextOffset - startOffset,
+			outputLines: content.length === 0 ? 0 : content.split("\n").length,
+			hasMore: nextOffset < size,
+		};
+	} catch (err: unknown) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw err;
+	} finally {
+		await file?.close();
+	}
+}
+
 async function removeJobFiles(job: JobRecord) {
 	await Promise.all(job.ownedLogPaths.map((path) => rm(path, { force: true })));
 }
@@ -390,7 +456,7 @@ function formatBool(v: boolean | undefined): string {
 	return v ? "yes" : "no";
 }
 
-function summarizeJob(job: JobRecord): string {
+function summarizeJob(job: JobRecord, includeLogPaths = true): string {
 	const runtimeMs = (job.endedAt ?? Date.now()) - job.startedAt;
 	return [
 		`Name: ${job.name}`,
@@ -400,9 +466,9 @@ function summarizeJob(job: JobRecord): string {
 		`Runtime: ${(runtimeMs / 1000).toFixed(1)}s`,
 		`Command: ${job.command}`,
 		`Cwd: ${job.cwd}`,
-		job.mergedPath ? `Merged log: ${job.mergedPath}` : undefined,
-		job.stdoutPath ? `Stdout log: ${job.stdoutPath}` : undefined,
-		job.stderrPath ? `Stderr log: ${job.stderrPath}` : undefined,
+		includeLogPaths && job.mergedPath ? `Merged log: ${job.mergedPath}` : undefined,
+		includeLogPaths && job.stdoutPath ? `Stdout log: ${job.stdoutPath}` : undefined,
+		includeLogPaths && job.stderrPath ? `Stderr log: ${job.stderrPath}` : undefined,
 	]
 		.filter(Boolean)
 		.join("\n");
@@ -441,8 +507,13 @@ export default function powershellExtension(pi: ExtensionAPI) {
 
 		powershellAvailabilityPromise ??= probePowerShell();
 		if (!(await powershellAvailabilityPromise)) {
+			const activeTools = new Set(pi.getActiveTools());
+			for (const tool of pi.getAllTools()) {
+				if (tool.name === "powershell" || tool.name.startsWith("pwsh-")) activeTools.delete(tool.name);
+			}
+			pi.setActiveTools(Array.from(activeTools));
 			ctx.ui.notify(
-				`PowerShell 7 is unavailable at '${DEFAULT_SHELL}'. Bash was left enabled. Install PowerShell 7 or set POWERSHELL_BIN, then reload Pi.`,
+				`PowerShell 7 is unavailable at '${DEFAULT_SHELL}'. PowerShell tools were disabled and Bash was left unchanged. Install PowerShell 7 or set POWERSHELL_BIN, then reload Pi.`,
 				"warning",
 			);
 			return;
@@ -493,6 +564,13 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				}
 			}),
 		);
+		if (jobs.size === 0) {
+			try {
+				await removeJobsDir();
+			} catch (error) {
+				errors.push(new Error("Failed to remove the PowerShell job log directory during shutdown.", { cause: error }));
+			}
+		}
 		if (errors.length > 0) throw new AggregateError(errors, "PowerShell job cleanup failed during shutdown.");
 	});
 
@@ -528,6 +606,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 			"Invoke the long-running program directly. Do not use Start-Process, Start-Job, a trailing background operator (`command &`), or another self-detaching/backgrounding construct inside the command; on Windows an escaped process cannot be reliably tracked after the root pwsh exits. The `&` call operator remains appropriate for synchronous invocation.",
 			"Check status with pwsh-get-job, read output with pwsh-get-job-output, and always clean up with pwsh-remove-job when finished.",
 			"Pass `stderr: \"null\"` or `stdout: \"null\"` to pwsh-start-job to discard a stream; pass a file path to redirect it. Omit both for a single merged log.",
+			"Use the env parameter for per-job environment variables instead of embedding environment assignment syntax in the command.",
 		],
 		parameters: Type.Object({
 			name: Type.String({
@@ -537,6 +616,11 @@ export default function powershellExtension(pi: ExtensionAPI) {
 			command: Type.String({ description: "The PowerShell command to run in the background" }),
 			workingDirectory: Type.Optional(
 				Type.String({ description: "Optional working directory, relative to the current project" }),
+			),
+			env: Type.Optional(
+				Type.Record(Type.String({ pattern: "^[^=\\u0000]+$" }), Type.String(), {
+					description: "Environment variables to add to or override for this job",
+				}),
 			),
 			stdout: Type.Optional(
 				Type.String({
@@ -570,6 +654,13 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				const jobsDir = await getJobsDir();
 				if (shuttingDown) throw new Error(`Starting job '${params.name}' was interrupted by PowerShell extension shutdown.`);
 				if (signal?.aborted) throw new Error(`Starting job '${params.name}' was aborted.`);
+				const jobEnv = createPiEnvironment(ctx);
+				for (const [name, value] of Object.entries(params.env ?? {})) {
+					if (!name || name.includes("=") || name.includes("\0") || value.includes("\0")) {
+						throw new Error(`Invalid environment variable for job '${params.name}'.`);
+					}
+					jobEnv[name] = value;
+				}
 				const bothDefault = params.stdout === undefined && params.stderr === undefined;
 				const stdoutSpec = resolveJobStream(jobsDir, cwd, params.name, "stdout", params.stdout, bothDefault);
 				const stderrSpec = resolveJobStream(jobsDir, cwd, params.name, "stderr", params.stderr, bothDefault);
@@ -578,26 +669,37 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				let stderrFd: number | "ignore" = "ignore";
 				let stdoutPath: string | null = null;
 				let stderrPath: string | null = null;
-				const openLog = (path: string) => {
-					const fd = openSync(path, "w");
+				const pathIsOwned = (path: string) =>
+					[stdoutSpec, stderrSpec]
+						.filter((spec): spec is Extract<JobStreamSpec, { kind: "file" }> => spec.kind === "file" && spec.path === path)
+						.every((spec) => spec.owned);
+				const openLog = (path: string, owned: boolean) => {
+					const fd = openSync(path, "w", owned ? 0o600 : 0o666);
+					if (owned && !IS_WINDOWS) chmodSync(path, 0o600);
 					openedFds.add(fd);
 					return fd;
 				};
 
 				if (mergedPath) {
-					stdoutFd = openLog(mergedPath);
+					stdoutFd = openLog(mergedPath, true);
 					stderrFd = stdoutFd;
 					ownedLogPaths = [mergedPath];
 				} else {
 					if (stdoutSpec.kind === "file") {
 						stdoutPath = stdoutSpec.path;
-						stdoutFd = openLog(stdoutPath);
-						if (stdoutSpec.owned) ownedLogPaths.push(stdoutPath);
+						const owned = pathIsOwned(stdoutPath);
+						stdoutFd = openLog(stdoutPath, owned);
+						if (owned) ownedLogPaths.push(stdoutPath);
 					}
 					if (stderrSpec.kind === "file") {
 						stderrPath = stderrSpec.path;
-						stderrFd = stderrPath === stdoutPath ? stdoutFd : openLog(stderrPath);
-						if (stderrSpec.owned) ownedLogPaths.push(stderrPath);
+						if (stderrPath === stdoutPath) {
+							stderrFd = stdoutFd;
+						} else {
+							const owned = pathIsOwned(stderrPath);
+							stderrFd = openLog(stderrPath, owned);
+							if (owned) ownedLogPaths.push(stderrPath);
+						}
 					}
 				}
 
@@ -606,7 +708,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 					["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", wrapCommand(params.command)],
 					{
 						cwd,
-						env: createPiEnvironment(ctx),
+						env: jobEnv,
 						detached: !IS_WINDOWS,
 						stdio: ["ignore", stdoutFd, stderrFd],
 						windowsHide: true,
@@ -793,48 +895,68 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		name: "pwsh-get-job-output",
 		label: "Get PowerShell Job Output",
 		description:
-			"Read captured stdout/stderr for a background PowerShell job. Returns the tail of each log file up to 2000 lines / 50KB per stream. Pass full=true to return the raw path to the untruncated log.",
+			"Read captured stdout/stderr for a background PowerShell job. By default, returns the tail of each log up to 2000 lines / 50KB. Pass cursor={} to read bounded chunks from the beginning without gaps, then pass each returned next cursor to continue. Pass full=true to include raw log paths.",
 		promptSnippet: "Read logged output for a pwsh background job.",
+		promptGuidelines: [
+			"For noisy long-running jobs, start with cursor={} and pass the returned nextCursor to each subsequent call. Reuse the last cursor later to read output appended after hasMore=no.",
+		],
 		parameters: Type.Object({
 			name: Type.String({ description: "Job name" }),
 			full: Type.Optional(
 				Type.Boolean({ description: "When true, also include the full log file path(s) so you can read them directly." }),
 			),
+			cursor: Type.Optional(
+				Type.Object({
+					merged: Type.Optional(Type.Integer({ minimum: 0, description: "Next byte offset for the merged log" })),
+					stdout: Type.Optional(Type.Integer({ minimum: 0, description: "Next byte offset for stdout" })),
+					stderr: Type.Optional(Type.Integer({ minimum: 0, description: "Next byte offset for stderr" })),
+				}),
+			),
 		}),
 		async execute(_toolCallId, params) {
 			const job = jobs.get(params.name);
 			if (!job) throw new Error(`No job named '${params.name}'.`);
-			const sections: string[] = [summarizeJob(job)];
-
-			if (job.mergedPath) {
-				const trunc = await readJobFile(job.mergedPath, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-				if (trunc === null) {
-					sections.push(`(merged log not yet created at ${job.mergedPath})`);
-				} else {
-					sections.push(
-						`merged output (truncated=${formatBool(trunc.truncated)}, lines=${trunc.outputLines}/${trunc.totalLinesKnown ? trunc.totalLines : "?"}, bytes=${trunc.outputBytes}/${trunc.totalBytes}):\n${trunc.content.trimEnd()}`,
+			const incremental = params.cursor !== undefined;
+			const sections: string[] = [summarizeJob(job, params.full === true)];
+			const nextCursor: Partial<Record<"merged" | "stdout" | "stderr", number>> = {};
+			const hasMore: Partial<Record<"merged" | "stdout" | "stderr", boolean>> = {};
+			const appendOutput = async (slot: "merged" | "stdout" | "stderr", label: string, path: string) => {
+				if (incremental) {
+					const trunc = await readJobFileFromCursor(
+						path,
+						params.cursor?.[slot] ?? 0,
+						DEFAULT_MAX_LINES,
+						DEFAULT_MAX_BYTES,
 					);
+					if (trunc === null) {
+						nextCursor[slot] = params.cursor?.[slot] ?? 0;
+						hasMore[slot] = false;
+						sections.push(`(${label} log not yet created${params.full ? ` at ${path}` : ""})`);
+						return;
+					}
+					nextCursor[slot] = trunc.nextOffset;
+					hasMore[slot] = trunc.hasMore;
+					sections.push(
+						`${label} (cursor=${trunc.startOffset}->${trunc.nextOffset}, lines=${trunc.outputLines}, bytes=${trunc.outputBytes}/${trunc.totalBytes}, hasMore=${formatBool(trunc.hasMore)}):\n${trunc.content || "(no new output)"}`,
+					);
+					return;
 				}
-			}
-			if (job.stdoutPath) {
-				const trunc = await readJobFile(job.stdoutPath, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+
+				const trunc = await readJobFile(path, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
 				sections.push(
 					trunc === null
-						? `(stdout log not yet created at ${job.stdoutPath})`
-						: `stdout (truncated=${formatBool(trunc.truncated)}, lines=${trunc.outputLines}/${trunc.totalLinesKnown ? trunc.totalLines : "?"}, bytes=${trunc.outputBytes}/${trunc.totalBytes}):\n${trunc.content.trimEnd()}`,
+						? `(${label} log not yet created${params.full ? ` at ${path}` : ""})`
+						: `${label} (truncated=${formatBool(trunc.truncated)}, lines=${trunc.outputLines}/${trunc.totalLinesKnown ? trunc.totalLines : "?"}, bytes=${trunc.outputBytes}/${trunc.totalBytes}):\n${trunc.content.trimEnd()}`,
 				);
-			}
-			if (job.stderrPath) {
-				const trunc = await readJobFile(job.stderrPath, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-				sections.push(
-					trunc === null
-						? `(stderr log not yet created at ${job.stderrPath})`
-						: `stderr (truncated=${formatBool(trunc.truncated)}, lines=${trunc.outputLines}/${trunc.totalLinesKnown ? trunc.totalLines : "?"}, bytes=${trunc.outputBytes}/${trunc.totalBytes}):\n${trunc.content.trimEnd()}`,
-				);
-			}
+			};
+
+			if (job.mergedPath) await appendOutput("merged", "merged output", job.mergedPath);
+			if (job.stdoutPath) await appendOutput("stdout", "stdout", job.stdoutPath);
+			if (job.stderrPath) await appendOutput("stderr", "stderr", job.stderrPath);
 			if (!job.mergedPath && !job.stdoutPath && !job.stderrPath) {
 				sections.push("(no log files — both streams were discarded)");
 			}
+			if (incremental) sections.push(`Next cursor: ${JSON.stringify(nextCursor)}`);
 
 			return {
 				content: [{ type: "text", text: sections.join("\n\n") }],
@@ -842,9 +964,11 @@ export default function powershellExtension(pi: ExtensionAPI) {
 					name: job.name,
 					status: job.status,
 					exitCode: job.exitCode,
-					mergedPath: params.full ? job.mergedPath : undefined,
-					stdoutPath: params.full ? job.stdoutPath : undefined,
-					stderrPath: params.full ? job.stderrPath : undefined,
+					mergedPath: params.full === true ? job.mergedPath : undefined,
+					stdoutPath: params.full === true ? job.stdoutPath : undefined,
+					stderrPath: params.full === true ? job.stderrPath : undefined,
+					nextCursor: incremental ? nextCursor : undefined,
+					hasMore: incremental ? hasMore : undefined,
 				},
 			};
 		},

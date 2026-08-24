@@ -11,11 +11,14 @@ This checklist tracks the deep-review follow-up for `extensions/powershell.ts`.
 - [x] Define Windows process-tree cleanup as best effort while the root `pwsh` remains alive.
 - [x] Tell agents to invoke long-running programs directly rather than through self-detaching PowerShell constructs.
 - [x] Document PowerShell's non-terminating error and native exit-code semantics.
+- [x] Restrict extension-owned job directories and logs to the current Unix user and delete the directory on shutdown.
+- [x] Add per-job environment overrides and incremental cursor-based output reads.
 
 ## Verification and distribution
 
 - [x] Add deterministic coverage for executable probing, shutdown races, quoting, paths, start validation, and exit codes.
 - [x] Run type checking and deterministic PowerShell integration tests on Linux with PowerShell 7.6.4.
+- [x] Configure the integration workflow for both Ubuntu and native Windows runners.
 - [x] Bound the supported Pi and TypeBox versions to tested compatibility ranges.
 - [x] Correct and expand the user documentation.
 
@@ -25,7 +28,9 @@ This checklist tracks the deep-review follow-up for `extensions/powershell.ts`.
 - [ ] Verify automatic tool activation when PowerShell 7 is present.
 - [ ] Verify `bash` remains active when PowerShell 7 is absent.
 - [ ] Verify foreground timeout and cancellation kill Windows descendants.
-- [ ] Verify `taskkill /T /F` stops directly launched long-running workloads.
+- [x] Verify `taskkill /T /F` stops directly launched long-running workloads.
 - [ ] Confirm and document the unsupported self-detaching `Start-Process` case.
+
+Deterministic checks for activation, fallback, and foreground descendant cleanup are included in `test:powershell`; the remaining boxes should be checked after the updated suite completes on the native Windows runner.
 
 If dependable ownership of self-detached Windows descendants becomes necessary, replace the best-effort contract with a Windows Job Object supervisor using `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.

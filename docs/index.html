@@ -327,9 +327,9 @@ Review staged changes. Focus on $@</code></pre>
           <ul>
             <li>Runs commands through <code>pwsh</code>, forcing UTF-8 output.</li>
             <li>On Windows, verifies PowerShell 7 before disabling <code>bash</code> and nudges the model toward PowerShell.</li>
-            <li>On Windows, routes user-entered <code>!</code> and <code>!!</code> commands through PowerShell, with Bash fallback when PowerShell 7 is unavailable.</li>
+            <li>On Windows, routes user-entered <code>!</code> and <code>!!</code> commands through PowerShell; unavailable PowerShell tools are disabled while Bash is left unchanged.</li>
             <li>Streams partial command output during execution.</li>
-            <li>Starts detached background jobs for dev servers/watchers and captures logs.</li>
+            <li>Starts detached background jobs with per-job environment overrides, private extension-owned logs, and bounded tail or cursor-based output reads.</li>
             <li>Uses pi events (<code>session_start</code>, <code>before_agent_start</code>, <code>user_bash</code>, <code>session_shutdown</code>) plus <code>registerTool</code>.</li>
           </ul>
         </div>
