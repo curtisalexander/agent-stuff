@@ -325,7 +325,7 @@ Review staged changes. Focus on $@</code></pre>
           <p>This is a real extension that registers a PowerShell tool plus background-job tools:</p>
           <p><span class="tag">powershell</span><span class="tag">pwsh-start-job</span><span class="tag">pwsh-get-job</span><span class="tag">pwsh-stop-job</span><span class="tag">pwsh-remove-job</span><span class="tag">pwsh-get-job-output</span></p>
           <ul>
-            <li>Runs commands through <code>pwsh</code>, forcing UTF-8 output.</li>
+            <li>Runs commands through <code>pwsh</code> with BOM-less UTF-8 input/output settings and independent stdout/stderr decoders.</li>
             <li>On Windows, verifies PowerShell 7 before disabling <code>bash</code> and nudges the model toward PowerShell.</li>
             <li>On Windows, routes user-entered <code>!</code> and <code>!!</code> commands through PowerShell; unavailable PowerShell tools are disabled while Bash is left unchanged.</li>
             <li>Streams partial command output during execution.</li>

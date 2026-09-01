@@ -13,10 +13,15 @@ This checklist tracks the deep-review follow-up for `extensions/powershell.ts`.
 - [x] Document PowerShell's non-terminating error and native exit-code semantics.
 - [x] Restrict extension-owned job directories and logs to the current Unix user and delete the directory on shutdown.
 - [x] Add per-job environment overrides and incremental cursor-based output reads.
+- [x] Set PowerShell console input, console output, and native pipeline input to BOM-less UTF-8.
+- [x] Decode stdout and stderr independently so interleaved chunks cannot corrupt split UTF-8 characters.
+- [x] Normalize foreground spill files and background logs to UTF-8 while removing one leading BOM per stream.
+- [x] Avoid decoding incomplete trailing UTF-8 characters while a live job log is being read.
 
 ## Verification and distribution
 
 - [x] Add deterministic coverage for executable probing, shutdown races, quoting, paths, start validation, and exit codes.
+- [x] Add deterministic coverage for per-stream BOMs and split multibyte characters across foreground updates, spill files, and merged background logs.
 - [x] Run type checking and deterministic PowerShell integration tests on Linux with PowerShell 7.6.4.
 - [x] Configure the integration workflow for both Ubuntu and native Windows runners.
 - [x] Bound the supported Pi and TypeBox versions to tested compatibility ranges.
@@ -30,6 +35,7 @@ This checklist tracks the deep-review follow-up for `extensions/powershell.ts`.
 - [ ] Verify foreground timeout and cancellation kill Windows descendants.
 - [x] Verify `taskkill /T /F` stops directly launched long-running workloads.
 - [ ] Confirm and document the unsupported self-detaching `Start-Process` case.
+- [ ] Run the split-stream/BOM regression cases on the native Windows CI runner.
 
 Deterministic checks for activation, fallback, and foreground descendant cleanup are included in `test:powershell`; the remaining boxes should be checked after the updated suite completes on the native Windows runner.
 

@@ -2,7 +2,7 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -159,6 +159,21 @@ Write-Output $value`,
 	);
 
 	const quotedNode = process.execPath.replaceAll("'", "''");
+	const encodingSettings = await foreground.execute(
+		"encoding-settings",
+		{
+			command:
+				'Write-Output "$([Console]::InputEncoding.WebName)|$([Console]::OutputEncoding.WebName)|$($OutputEncoding.WebName)"',
+		},
+		undefined,
+		undefined,
+		ctx,
+	);
+	assert(
+		encodingSettings.content[0].text.trim() === "utf-8|utf-8|utf-8",
+		`PowerShell input/output encodings were not all UTF-8: ${encodingSettings.content[0].text}`,
+	);
+
 	const nativePipeline = await foreground.execute(
 		"native-pipeline",
 		{
@@ -174,6 +189,41 @@ Write-Output $value`,
 		nativePipelineHex.startsWith(Buffer.from("yes-雪-🚀", "utf8").toString("hex")),
 		"PowerShell did not pass UTF-8 text through a native pipeline",
 	);
+
+	const nativeInterleaveScript =
+		'const bom=Buffer.from([0xef,0xbb,0xbf]);const value=Buffer.from("🚀");process.stdout.write(bom);process.stdout.write("x".repeat(60000));process.stdout.write(value.subarray(0,2));setTimeout(()=>{process.stderr.write(Buffer.concat([bom,Buffer.from("between-雪\\n")]));setTimeout(()=>process.stdout.write(value.subarray(2)),100)},100)';
+	const interleavedUpdates = [];
+	const interleaved = await foreground.execute(
+		"interleaved-unicode-streams",
+		{ command: `& '${quotedNode}' -e '${nativeInterleaveScript}'` },
+		undefined,
+		(update) => {
+			interleavedUpdates.push(
+				update.content.map((part) => (part.type === "text" ? part.text : "")).join(""),
+			);
+		},
+		ctx,
+	);
+	const interleavedText = interleaved.content[0].text;
+	assert(interleavedText.includes("🚀"), "the foreground tail lost its final interleaved Unicode character");
+	assert(!interleavedText.includes("�"), "foreground interleaved Unicode produced a replacement character");
+	assert(!interleavedText.includes("\uFEFF"), "foreground output retained a per-stream UTF-8 BOM");
+	assert(
+		interleavedUpdates.every((text) => !text.includes("�") && !text.includes("\uFEFF")),
+		"a foreground streaming update exposed corrupt Unicode or a BOM",
+	);
+	assert(interleavedUpdates.some((text) => text.includes("between-雪")), "a foreground streaming update lost stderr Unicode");
+	fullOutputPath = interleaved.details?.fullOutputPath;
+	assert(interleaved.details?.truncation?.truncated && fullOutputPath, "interleaved output was not spilled for verification");
+	const interleavedFullText = await readFile(fullOutputPath, "utf8");
+	assert(
+		interleavedFullText.includes("between-雪") && interleavedFullText.includes("🚀"),
+		"the spilled foreground output lost interleaved Unicode",
+	);
+	assert(!interleavedFullText.includes("�"), "the spilled foreground output contained a replacement character");
+	assert(!interleavedFullText.includes("\uFEFF"), "the spilled foreground output retained a per-stream UTF-8 BOM");
+	await rm(fullOutputPath, { force: true });
+	fullOutputPath = undefined;
 
 	let strictError = "";
 	try {
@@ -473,6 +523,7 @@ Write-Output $value`,
 		ctx,
 	);
 	await waitForJob(customLogJob, "exited");
+	assert((await readFile(customLog, "utf8")).includes("caller-owned"), "caller-owned log capture was incomplete");
 	await removeJob(customLogJob);
 	assert(existsSync(customLog), "removing a job deleted its caller-owned log");
 
@@ -513,6 +564,28 @@ Write-Output $value`,
 		"separate stdout/stderr cursor reads failed",
 	);
 	await removeJob(separateStreamsJob);
+
+	const mergedUnicodeJob = `merged-unicode-${process.pid}`;
+	startedJobs.add(mergedUnicodeJob);
+	const mergedUnicodeStart = await requiredTool("pwsh-start-job").execute(
+		"merged-unicode-start",
+		{ name: mergedUnicodeJob, command: `& '${quotedNode}' -e '${nativeInterleaveScript}'` },
+		undefined,
+		undefined,
+		ctx,
+	);
+	await waitForJob(mergedUnicodeJob, "exited");
+	const mergedUnicodeOutput = await requiredTool("pwsh-get-job-output").execute("merged-unicode-output", {
+		name: mergedUnicodeJob,
+	});
+	const mergedUnicodeText = mergedUnicodeOutput.content[0].text;
+	assert(mergedUnicodeText.includes("between-雪") && mergedUnicodeText.includes("🚀"), "merged job Unicode was lost");
+	assert(!mergedUnicodeText.includes("�"), "merged job output produced a replacement character");
+	assert(!mergedUnicodeText.includes("\uFEFF"), "merged job output retained a per-stream UTF-8 BOM");
+	const mergedUnicodeLog = await readFile(mergedUnicodeStart.details.mergedPath, "utf8");
+	assert(!mergedUnicodeLog.includes("�"), "the normalized merged log contained a replacement character");
+	assert(!mergedUnicodeLog.includes("\uFEFF"), "the normalized merged log retained a per-stream UTF-8 BOM");
+	await removeJob(mergedUnicodeJob);
 
 	const largeJob = `large-job-${process.pid}`;
 	startedJobs.add(largeJob);
@@ -601,7 +674,9 @@ Write-Output $value`,
 				unavailableFallback: process.platform === "win32" ? "passed" : "Windows-only",
 				userBashRouting: process.platform === "win32" ? "PowerShell passed" : "default shell preserved",
 				multilineQuoting: "passed",
+				utf8EncodingSettings: "passed",
 				nativePipelineUtf8: "passed",
+				interleavedForegroundUtf8: "passed",
 				strictErrors: "passed",
 				streamingUpdates,
 				nonzeroExit: "passed",
@@ -620,6 +695,7 @@ Write-Output $value`,
 				backgroundEnvironment: "passed",
 				backgroundEnvironmentOverride: "passed",
 				separateStreams: "passed",
+				mergedInterleavedUtf8: "passed",
 				boundedBackgroundTail: "passed",
 				incrementalBackgroundOutput: "passed",
 				fullLogPathOptIn: "passed",

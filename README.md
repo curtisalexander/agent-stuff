@@ -110,7 +110,7 @@ See `docs/agentsview-extension-plan.md` for the design notes and follow-up resea
 Adds a `powershell` tool plus a set of background-job tools (`pwsh-start-job`,
 `pwsh-get-job`, `pwsh-stop-job`, `pwsh-remove-job`, `pwsh-get-job-output`) for:
 
-- running PowerShell commands via `pwsh`, with forced UTF-8 output
+- running PowerShell commands via `pwsh`, with BOM-less UTF-8 input/output settings and independent streaming decoders for stdout and stderr
 - Windows-oriented shell workflows inside pi
 - explicit `cmd.exe /c ...` support when a batch file requires cmd syntax
 - background processes (dev servers, watchers) that survive across tool calls in the current Pi session runtime
@@ -131,6 +131,10 @@ Jobs survive tool calls, not extension-runtime replacement. Pi `/reload`, `/new`
 
 Use `pwsh-start-job`'s `env` object for per-job environment variables. `pwsh-get-job-output` returns a bounded tail by default; pass `cursor: {}` to read from the beginning, then pass its returned `nextCursor` to consume subsequent chunks without gaps. Pass `full: true` only when raw log paths are needed.
 
+The extension sets `[Console]::InputEncoding`, `[Console]::OutputEncoding`, and `$OutputEncoding` to BOM-less UTF-8 for every command. It decodes stdout and stderr independently before merging them, removes a leading UTF-8 BOM from each stream, and stores normalized UTF-8 job logs. This prevents valid multibyte characters from becoming replacement characters when operating-system chunks or the two streams interleave. The relative ordering of independently buffered stdout and stderr writes is inherently not exact, but each stream's characters remain intact. PowerShell 7 text cmdlets also default to `utf8NoBOM`; use an explicit `-Encoding` when reading or writing a known legacy or non-UTF-8 file.
+
+No launcher can safely infer arbitrary native-program output encodings. Native tools that ignore the UTF-8 console settings and emit an OEM/ANSI code page, UTF-16, or binary data must be configured to emit UTF-8 or redirected to a file and decoded with the known encoding. Once malformed bytes or a replacement character have already been produced by a native tool, file decoder, parent terminal, model/provider, or Pi itself, this extension cannot reconstruct the original character.
+
 PowerShell non-terminating errors do not always produce a failing process exit code. For failure-sensitive automation, opt in explicitly as appropriate:
 
 ```powershell
@@ -147,7 +151,7 @@ npm run check
 npm run test:powershell
 ```
 
-`test:powershell` is a deterministic integration test that loads the extension, invokes real PowerShell without an LLM, and covers executable probing, Windows tool activation and unavailable-PowerShell fallback, user `!` command routing, multiline commands and quoting, BOM-less UTF-8 native pipeline input, strict errors, merged and separate stdout/stderr, streaming, Pi session and per-job environment variables, foreground and background nonzero exits, timeout/abort descendant cleanup, large-output tail and cursor reads, full-path opt-in, private log permissions, Unicode working directories, background start validation and duplicate prevention, background completion/stop, Unix descendant cleanup, custom-log preservation, shutdown racing an in-flight start, and job-directory cleanup across session restart.
+`test:powershell` is a deterministic integration test that loads the extension, invokes real PowerShell without an LLM, and covers executable probing, Windows tool activation and unavailable-PowerShell fallback, user `!` command routing, multiline commands and quoting, UTF-8 input/output settings, BOM-less native pipeline input, deliberately split multibyte stdout interleaved with stderr, per-stream BOM removal, normalized merged job logs, strict errors, merged and separate stdout/stderr, streaming and spilled full output, Pi session and per-job environment variables, foreground and background nonzero exits, timeout/abort descendant cleanup, large-output tail and cursor reads, full-path opt-in, private log permissions, Unicode working directories, background start validation and duplicate prevention, background completion/stop, Unix descendant cleanup, custom-log preservation, shutdown racing an in-flight start, and job-directory cleanup across session restart.
 
 The PowerShell workflow runs this suite on both Ubuntu and a native Windows runner. See `docs/powershell-hardening.md` for the platform-specific verification checklist and the condition that would justify a future Windows Job Object supervisor.
 

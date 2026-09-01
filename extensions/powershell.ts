@@ -15,10 +15,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, closeSync, openSync } from "node:fs";
+import { chmodSync, closeSync, openSync, writeSync } from "node:fs";
 import { access, chmod, mkdir, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import type { Readable } from "node:stream";
 
 const DEFAULT_SHELL = process.env.POWERSHELL_BIN || "pwsh";
 const IS_WINDOWS = process.platform === "win32";
@@ -28,6 +29,7 @@ const EXIT_STDIO_GRACE_MS = 100;
 const POWERSHELL_PROBE_TIMEOUT_MS = 5_000;
 
 const UTF8_PREFIX =
+	"[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); " +
 	"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); " +
 	"$OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n";
 
@@ -61,6 +63,66 @@ function resolveWorkingDirectory(cwd: string, inputCwd?: string): string {
 
 function wrapCommand(command: string): string {
 	return UTF8_PREFIX + command;
+}
+
+// stdout and stderr are independent byte streams. Decode each one separately
+// before forwarding it to a shared consumer; otherwise an intervening chunk
+// from the other stream can corrupt a split multibyte UTF-8 character. The
+// TextDecoder also consumes one UTF-8 BOM at the start of each stream.
+function forwardUtf8Stream(stream: Readable, onData: (data: Buffer) => void): Promise<void> {
+	const decoder = new TextDecoder("utf-8");
+	return new Promise((resolveForward, rejectForward) => {
+		let settled = false;
+		const cleanup = () => {
+			stream.removeListener("data", onChunk);
+			stream.removeListener("end", onEnd);
+			stream.removeListener("close", onEnd);
+			stream.removeListener("error", onError);
+		};
+		const emit = (text: string) => {
+			if (text) onData(Buffer.from(text, "utf8"));
+		};
+		const finish = () => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			try {
+				emit(decoder.decode());
+				resolveForward();
+			} catch (error) {
+				rejectForward(error);
+			}
+		};
+		const fail = (error: unknown) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			stream.resume();
+			rejectForward(error);
+		};
+		const onChunk = (chunk: Buffer) => {
+			try {
+				emit(decoder.decode(chunk, { stream: true }));
+			} catch (error) {
+				fail(error);
+			}
+		};
+		const onEnd = () => finish();
+		const onError = (error: Error) => fail(error);
+		stream.on("data", onChunk);
+		stream.once("end", onEnd);
+		stream.once("close", onEnd);
+		stream.once("error", onError);
+	});
+}
+
+function writeAll(fd: number, data: Buffer): void {
+	let offset = 0;
+	while (offset < data.length) {
+		const written = writeSync(fd, data, offset, data.length - offset);
+		if (written === 0) throw new Error("Could not write captured PowerShell output.");
+		offset += written;
+	}
 }
 
 export function probePowerShell(shell = DEFAULT_SHELL): Promise<boolean> {
@@ -274,8 +336,14 @@ const powershellOperations: BashOperations = {
 				windowsHide: true,
 			},
 		);
-		child.stdout?.on("data", onData);
-		child.stderr?.on("data", onData);
+		let outputError: unknown;
+		const outputDone = Promise.all(
+			[child.stdout, child.stderr]
+				.filter((stream): stream is Readable => stream !== null)
+				.map((stream) => forwardUtf8Stream(stream, onData)),
+		).catch((error) => {
+			outputError = error;
+		});
 
 		let timedOut = false;
 		let timeoutId: NodeJS.Timeout | undefined;
@@ -294,9 +362,11 @@ const powershellOperations: BashOperations = {
 				else signal.addEventListener("abort", onAbort, { once: true });
 			}
 			const exitCode = await waitForChildProcess(child);
+			await outputDone;
 			if (termination) await termination;
 			if (signal?.aborted) throw new Error("aborted");
 			if (timedOut) throw new Error(`timeout:${timeout}`);
+			if (outputError) throw outputError;
 			return { exitCode };
 		} finally {
 			if (timeoutId) clearTimeout(timeoutId);
@@ -331,6 +401,8 @@ interface JobRecord {
 	ownedLogPaths: string[];
 	status: "running" | "exited";
 	child: ChildProcess;
+	outputDone: Promise<void>;
+	outputError: Error | null;
 	trackingStopped: boolean;
 }
 
@@ -372,7 +444,9 @@ async function readJobFile(path: string, maxLines: number, maxBytes: number) {
 		}
 		let utf8Start = 0;
 		while (utf8Start < bytesRead && (buffer[utf8Start] & 0xc0) === 0x80) utf8Start++;
-		const truncation = truncateTail(buffer.subarray(utf8Start, bytesRead).toString("utf8"), {
+		const candidate = buffer.subarray(utf8Start, bytesRead);
+		const completeLength = completeUtf8PrefixLength(candidate);
+		const truncation = truncateTail(candidate.subarray(0, completeLength).toString("utf8"), {
 			maxLines,
 			maxBytes,
 		});
@@ -466,6 +540,7 @@ function summarizeJob(job: JobRecord, includeLogPaths = true): string {
 		`Runtime: ${(runtimeMs / 1000).toFixed(1)}s`,
 		`Command: ${job.command}`,
 		`Cwd: ${job.cwd}`,
+		job.outputError ? `Output capture error: ${job.outputError.message}` : undefined,
 		includeLogPaths && job.mergedPath ? `Merged log: ${job.mergedPath}` : undefined,
 		includeLogPaths && job.stdoutPath ? `Stdout log: ${job.stdoutPath}` : undefined,
 		includeLogPaths && job.stderrPath ? `Stderr log: ${job.stderrPath}` : undefined,
@@ -482,6 +557,7 @@ function markJobExited(job: JobRecord, code: number | null = job.child.exitCode)
 
 async function trackProcessGroupExit(job: JobRecord, code: number | null) {
 	if (IS_WINDOWS || !processGroupExists(job.pid)) {
+		await job.outputDone;
 		markJobExited(job, code);
 		return;
 	}
@@ -489,14 +565,36 @@ async function trackProcessGroupExit(job: JobRecord, code: number | null) {
 	while (!job.trackingStopped && job.status === "running" && processGroupExists(job.pid)) {
 		await new Promise((resolveWait) => setTimeout(resolveWait, 100));
 	}
-	if (!job.trackingStopped && job.status === "running") markJobExited(job, code);
+	if (!job.trackingStopped && job.status === "running") {
+		await job.outputDone;
+		markJobExited(job, code);
+	}
+}
+
+async function finishTerminatedOutput(child: ChildProcess, outputDone: Promise<void>) {
+	let timer: NodeJS.Timeout | undefined;
+	const completed = await Promise.race([
+		outputDone.then(() => true),
+		new Promise<false>((resolveWait) => {
+			timer = setTimeout(() => resolveWait(false), EXIT_STDIO_GRACE_MS);
+		}),
+	]);
+	if (timer) clearTimeout(timer);
+	if (completed) return;
+	child.stdout?.destroy();
+	child.stderr?.destroy();
+	await outputDone;
 }
 
 async function stopJob(job: JobRecord) {
-	if (job.status === "exited") return;
+	if (job.status === "exited") {
+		await job.outputDone;
+		return;
+	}
 	if (!(await terminateProcessTree(job.child))) {
 		throw new Error(`Could not stop the process tree for job '${job.name}' (pid ${job.pid}).`);
 	}
+	await finishTerminatedOutput(job.child, job.outputDone);
 	markJobExited(job);
 }
 
@@ -580,11 +678,12 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		name: "powershell",
 		label: "PowerShell",
 		description:
-			`Run PowerShell commands via pwsh in the current working directory. Output is forced to UTF-8 and truncated to the last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB; full output is saved to a temp file when truncated. Optionally provide a timeout in seconds. Invoke batch files explicitly with cmd.exe /c when cmd syntax is required.`,
+			`Run PowerShell commands via pwsh in the current working directory. PowerShell input and output are configured for BOM-less UTF-8; stdout and stderr are decoded independently. Output is truncated to the last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB, with full output saved to a temp file when truncated. Optionally provide a timeout in seconds. Invoke batch files explicitly with cmd.exe /c when cmd syntax is required.`,
 		promptSnippet: "Execute PowerShell commands with pwsh",
 		promptGuidelines: [
 			"Use powershell instead of bash when the user explicitly asks for PowerShell or when Windows-specific commands are needed.",
 			"Prefer powershell for PowerShell syntax such as Get-ChildItem, Select-String, pipelines, or .ps1 scripts.",
+			"PowerShell 7 text cmdlets default to BOM-less UTF-8. Pass -Encoding explicitly for known legacy or non-UTF-8 files, configure native programs themselves to emit UTF-8, and redirect binary output to a file rather than returning it as text.",
 			"For failure-sensitive automation, set $ErrorActionPreference = 'Stop', consider $PSNativeCommandUseErrorActionPreference = $true, and inspect $LASTEXITCODE when appropriate; PowerShell can otherwise report success after an earlier non-terminating error.",
 			"Use pwsh-start-job (not powershell with a trailing background operator such as `command &`) when you need to run a dev server, test watcher, or any long-running process. pwsh-start-job survives across tool calls; a backgrounded powershell call does not.",
 			"Inspect PI_* environment variables for current model and session details.",
@@ -599,12 +698,13 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		name: "pwsh-start-job",
 		label: "Start PowerShell Job",
 		description:
-			"Start a background PowerShell process that survives across tool calls in the current Pi session runtime. Use for dev servers, test watchers, or other long-running tasks. Invoke the long-running program directly; do not use Start-Process, Start-Job, or another self-detaching launcher because it can escape tracking on Windows. Output is captured to a log file (merged by default) and readable via pwsh-get-job-output. Use pwsh-stop-job / pwsh-remove-job to clean up.",
+			"Start a background PowerShell process that survives across tool calls in the current Pi session runtime. Use for dev servers, test watchers, or other long-running tasks. Invoke the long-running program directly; do not use Start-Process, Start-Job, or another self-detaching launcher because it can escape tracking on Windows. UTF-8 text output is normalized into a log file (merged by default) and readable via pwsh-get-job-output. Use pwsh-stop-job / pwsh-remove-job to clean up.",
 		promptSnippet: "Start a detached PowerShell background process, tracked by name.",
 		promptGuidelines: [
 			"Use pwsh-start-job for long-running processes (dev servers, watchers) so they persist across tool calls.",
 			"Invoke the long-running program directly. Do not use Start-Process, Start-Job, a trailing background operator (`command &`), or another self-detaching/backgrounding construct inside the command; on Windows an escaped process cannot be reliably tracked after the root pwsh exits. The `&` call operator remains appropriate for synchronous invocation.",
 			"Check status with pwsh-get-job, read output with pwsh-get-job-output, and always clean up with pwsh-remove-job when finished.",
+			"Configure native programs to emit UTF-8 text. Redirect binary data or output in another encoding to an appropriate file instead of the job log.",
 			"Pass `stderr: \"null\"` or `stdout: \"null\"` to pwsh-start-job to discard a stream; pass a file path to redirect it. Omit both for a single merged log.",
 			"Use the env parameter for per-job environment variables instead of embedding environment assignment syntax in the command.",
 		],
@@ -648,7 +748,24 @@ export default function powershellExtension(pi: ExtensionAPI) {
 			const openedFds = new Set<number>();
 			let child: ChildProcess | undefined;
 			let record: JobRecord | undefined;
+			let outputDone: Promise<void> | undefined;
+			let pendingOutputError: Error | null = null;
 			let ownedLogPaths: string[] = [];
+			const setOutputError = (error: unknown) => {
+				const normalized = error instanceof Error ? error : new Error(String(error));
+				pendingOutputError ??= normalized;
+				if (record) record.outputError ??= normalized;
+			};
+			const closeOpenedFds = () => {
+				for (const fd of openedFds) {
+					try {
+						closeSync(fd);
+					} catch (error) {
+						setOutputError(error);
+					}
+				}
+				openedFds.clear();
+			};
 			try {
 				const cwd = resolveWorkingDirectory(ctx.cwd, params.workingDirectory);
 				const jobsDir = await getJobsDir();
@@ -710,10 +827,24 @@ export default function powershellExtension(pi: ExtensionAPI) {
 						cwd,
 						env: jobEnv,
 						detached: !IS_WINDOWS,
-						stdio: ["ignore", stdoutFd, stderrFd],
+						stdio: ["ignore", stdoutFd === "ignore" ? "ignore" : "pipe", stderrFd === "ignore" ? "ignore" : "pipe"],
 						windowsHide: true,
 					},
 				);
+				const capture = (stream: Readable | null, fd: number | "ignore") => {
+					if (stream === null || fd === "ignore") return Promise.resolve();
+					return forwardUtf8Stream(stream, (data) => {
+						if (pendingOutputError) return;
+						try {
+							writeAll(fd, data);
+						} catch (error) {
+							setOutputError(error);
+						}
+					}).catch(setOutputError);
+				};
+				outputDone = Promise.all([capture(child.stdout, stdoutFd), capture(child.stderr, stderrFd)])
+					.then(() => undefined)
+					.finally(closeOpenedFds);
 				if (child.pid) {
 					record = {
 						name: params.name,
@@ -729,11 +860,13 @@ export default function powershellExtension(pi: ExtensionAPI) {
 						ownedLogPaths,
 						status: "running",
 						child,
+						outputDone,
+						outputError: pendingOutputError,
 						trackingStopped: false,
 					};
 					jobs.set(params.name, record);
 					child.on("close", (code) => void trackProcessGroupExit(record!, code));
-					child.on("error", () => markJobExited(record!));
+					child.on("error", () => void record!.outputDone.then(() => markJobExited(record!)));
 				}
 				await new Promise<void>((resolveSpawn, rejectSpawn) => {
 					const onSpawn = () => {
@@ -775,6 +908,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				try {
 					if (record) {
 						if (record.status === "running") await stopJob(record);
+						else await record.outputDone;
 						record.trackingStopped = true;
 						await removeJobFiles(record);
 						jobs.delete(record.name);
@@ -782,6 +916,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 						if (child?.pid && !childHasExited(child) && !(await terminateProcessTree(child))) {
 							throw new Error(`Could not stop the untracked process for job '${params.name}'.`);
 						}
+						if (child && outputDone) await finishTerminatedOutput(child, outputDone);
 						await Promise.allSettled(ownedLogPaths.map((path) => rm(path, { force: true })));
 					}
 				} catch (cleanupError) {
@@ -789,7 +924,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				}
 				throw error;
 			} finally {
-				for (const fd of openedFds) closeSync(fd);
+				if (!outputDone) closeOpenedFds();
 				startingJobs.delete(params.name);
 				completeOperation();
 				startingJobOperations.delete(operation);
