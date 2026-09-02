@@ -5,14 +5,18 @@
 // PowerShell's Start-Process.
 //   https://github.com/marcfargas/pi-powershell
 import {
-	createBashToolDefinition,
+	createPowerShellToolDefinition,
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
+	keyHint,
+	truncateToVisualLines,
 	truncateTail,
-	type BashOperations,
 	type ExtensionAPI,
 	type ExtensionContext,
+	type PowerShellOperations,
+	type Theme,
 } from "@earendil-works/pi-coding-agent";
+import { Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn, type ChildProcess } from "node:child_process";
 import { chmodSync, closeSync, openSync, writeSync } from "node:fs";
@@ -27,6 +31,9 @@ const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 const EXIT_STDIO_GRACE_MS = 100;
 const POWERSHELL_PROBE_TIMEOUT_MS = 5_000;
+const JOB_STATUS_KEY = "powershell-jobs";
+const JOB_FAILURE_MESSAGE_TYPE = "powershell-job-failed";
+const JOB_OUTPUT_PREVIEW_LINES = 5;
 
 const UTF8_PREFIX =
 	"[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); " +
@@ -225,7 +232,8 @@ async function taskkill(pid: number, force: boolean): Promise<number> {
 	return new Promise((resolveKill) => {
 		const args = ["/PID", String(pid), "/T"];
 		if (force) args.push("/F");
-		const killer = spawn("taskkill.exe", args, { stdio: "ignore", windowsHide: true });
+		const taskkillPath = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe");
+		const killer = spawn(taskkillPath, args, { stdio: "ignore", windowsHide: true });
 		killer.once("error", () => resolveKill(-1));
 		killer.once("close", (code) => resolveKill(code ?? -1));
 	});
@@ -314,7 +322,7 @@ function waitForChildProcess(child: ChildProcess): Promise<number | null> {
 	});
 }
 
-const powershellOperations: BashOperations = {
+const powershellOperations: PowerShellOperations = {
 	async exec(command, cwd, { onData, signal, timeout, env }) {
 		const timeoutMs = resolveTimeoutMs(timeout);
 		if (signal?.aborted) throw new Error("aborted");
@@ -382,9 +390,45 @@ interface JobSummary {
 	exitCode: number | null;
 	startedAt: number;
 	endedAt: number | null;
+	command: string;
+	cwd: string;
 	mergedPath: string | null;
 	stdoutPath: string | null;
 	stderrPath: string | null;
+}
+
+interface JobOutputSection {
+	slot: "merged" | "stdout" | "stderr";
+	label: string;
+	content: string;
+	outputLines: number;
+	outputBytes: number;
+	totalBytes: number;
+	truncated?: boolean;
+	startOffset?: number;
+	nextOffset?: number;
+	hasMore?: boolean;
+}
+
+interface JobOutputDetails {
+	name: string;
+	status: "running" | "exited";
+	exitCode: number | null;
+	startedAt: number;
+	endedAt: number | null;
+	mergedPath?: string | null;
+	stdoutPath?: string | null;
+	stderrPath?: string | null;
+	nextCursor?: Partial<Record<"merged" | "stdout" | "stderr", number>>;
+	hasMore?: Partial<Record<"merged" | "stdout" | "stderr", boolean>>;
+	outputs: JobOutputSection[];
+}
+
+interface JobFailureDetails {
+	name: string;
+	pid: number;
+	exitCode: number;
+	endedAt: number;
 }
 
 interface JobRecord {
@@ -404,6 +448,8 @@ interface JobRecord {
 	outputDone: Promise<void>;
 	outputError: Error | null;
 	trackingStopped: boolean;
+	stopRequested: boolean;
+	completionReported: boolean;
 }
 
 const jobs = new Map<string, JobRecord>();
@@ -591,6 +637,7 @@ async function stopJob(job: JobRecord) {
 		await job.outputDone;
 		return;
 	}
+	job.stopRequested = true;
 	if (!(await terminateProcessTree(job.child))) {
 		throw new Error(`Could not stop the process tree for job '${job.name}' (pid ${job.pid}).`);
 	}
@@ -598,9 +645,330 @@ async function stopJob(job: JobRecord) {
 	markJobExited(job);
 }
 
+function toJobSummary(job: JobRecord): JobSummary {
+	return {
+		name: job.name,
+		status: job.status,
+		pid: job.pid,
+		exitCode: job.exitCode,
+		startedAt: job.startedAt,
+		endedAt: job.endedAt,
+		command: job.command,
+		cwd: job.cwd,
+		mergedPath: job.mergedPath,
+		stdoutPath: job.stdoutPath,
+		stderrPath: job.stderrPath,
+	};
+}
+
+type JobOutputParams = {
+	full?: boolean;
+	cursor?: Partial<Record<"merged" | "stdout" | "stderr", number>>;
+};
+
+async function getJobOutputResult(job: JobRecord, params: JobOutputParams) {
+	const incremental = params.cursor !== undefined;
+	const sections: string[] = [summarizeJob(job, params.full === true)];
+	const outputs: JobOutputSection[] = [];
+	const nextCursor: Partial<Record<"merged" | "stdout" | "stderr", number>> = {};
+	const hasMore: Partial<Record<"merged" | "stdout" | "stderr", boolean>> = {};
+	const appendOutput = async (slot: "merged" | "stdout" | "stderr", label: string, path: string) => {
+		if (incremental) {
+			const trunc = await readJobFileFromCursor(
+				path,
+				params.cursor?.[slot] ?? 0,
+				DEFAULT_MAX_LINES,
+				DEFAULT_MAX_BYTES,
+			);
+			if (trunc === null) {
+				nextCursor[slot] = params.cursor?.[slot] ?? 0;
+				hasMore[slot] = false;
+				sections.push(`(${label} log not yet created${params.full ? ` at ${path}` : ""})`);
+				return;
+			}
+			nextCursor[slot] = trunc.nextOffset;
+			hasMore[slot] = trunc.hasMore;
+			outputs.push({ slot, label, ...trunc });
+			sections.push(
+				`${label} (cursor=${trunc.startOffset}->${trunc.nextOffset}, lines=${trunc.outputLines}, bytes=${trunc.outputBytes}/${trunc.totalBytes}, hasMore=${formatBool(trunc.hasMore)}):\n${trunc.content || "(no new output)"}`,
+			);
+			return;
+		}
+
+		const trunc = await readJobFile(path, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+		if (trunc === null) {
+			sections.push(`(${label} log not yet created${params.full ? ` at ${path}` : ""})`);
+			return;
+		}
+		outputs.push({
+			slot,
+			label,
+			content: trunc.content.trimEnd(),
+			outputLines: trunc.outputLines,
+			outputBytes: trunc.outputBytes,
+			totalBytes: trunc.totalBytes,
+			truncated: trunc.truncated,
+		});
+		sections.push(
+			`${label} (truncated=${formatBool(trunc.truncated)}, lines=${trunc.outputLines}/${trunc.totalLinesKnown ? trunc.totalLines : "?"}, bytes=${trunc.outputBytes}/${trunc.totalBytes}):\n${trunc.content.trimEnd()}`,
+		);
+	};
+
+	if (job.mergedPath) await appendOutput("merged", "merged output", job.mergedPath);
+	if (job.stdoutPath) await appendOutput("stdout", "stdout", job.stdoutPath);
+	if (job.stderrPath) await appendOutput("stderr", "stderr", job.stderrPath);
+	if (!job.mergedPath && !job.stdoutPath && !job.stderrPath) {
+		sections.push("(no log files — both streams were discarded)");
+	}
+	if (incremental) sections.push(`Next cursor: ${JSON.stringify(nextCursor)}`);
+
+	const details: JobOutputDetails = {
+		name: job.name,
+		status: job.status,
+		exitCode: job.exitCode,
+		startedAt: job.startedAt,
+		endedAt: job.endedAt,
+		mergedPath: params.full === true ? job.mergedPath : undefined,
+		stdoutPath: params.full === true ? job.stdoutPath : undefined,
+		stderrPath: params.full === true ? job.stderrPath : undefined,
+		nextCursor: incremental ? nextCursor : undefined,
+		hasMore: incremental ? hasMore : undefined,
+		outputs,
+	};
+	return { content: [{ type: "text" as const, text: sections.join("\n\n") }], details };
+}
+
+function updateJobStatus(ctx: ExtensionContext | undefined): void {
+	if (!ctx?.ui?.setStatus) return;
+	const tracked = Array.from(jobs.values());
+	if (tracked.length === 0) {
+		ctx.ui.setStatus(JOB_STATUS_KEY, undefined);
+		return;
+	}
+	const running = tracked.filter((job) => job.status === "running").length;
+	const failed = tracked.filter(
+		(job) => job.status === "exited" && !job.stopRequested && job.exitCode !== null && job.exitCode !== 0,
+	).length;
+	const done = tracked.length - running - failed;
+	const parts = [running > 0 ? `${running} running` : undefined, failed > 0 ? `${failed} failed` : undefined, done > 0 ? `${done} done` : undefined];
+	ctx.ui.setStatus(JOB_STATUS_KEY, `pwsh: ${parts.filter(Boolean).join(" · ")}`);
+}
+
+function formatDuration(ms: number): string {
+	if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+	const minutes = Math.floor(ms / 60_000);
+	const seconds = Math.floor((ms % 60_000) / 1000);
+	return `${minutes}m ${seconds}s`;
+}
+
+function formatJobAge(job: Pick<JobSummary, "startedAt" | "endedAt">): string {
+	return formatDuration(Math.max(0, (job.endedAt ?? Date.now()) - job.startedAt));
+}
+
+interface JobToolRenderState {
+	operationStartedAt?: number;
+	operationEndedAt?: number;
+}
+
+interface JobToolRenderContext {
+	lastComponent: Component | undefined;
+	state: JobToolRenderState;
+	executionStarted: boolean;
+	isError: boolean;
+}
+
+class WidthAwareToolComponent implements Component {
+	private renderer: (width: number) => string[] = () => [];
+	private cachedWidth: number | undefined;
+	private cachedLines: string[] | undefined;
+
+	setRenderer(renderer: (width: number) => string[]): void {
+		this.renderer = renderer;
+		this.invalidate();
+	}
+
+	render(width: number): string[] {
+		if (this.cachedLines === undefined || this.cachedWidth !== width) {
+			this.cachedWidth = width;
+			this.cachedLines = this.renderer(Math.max(1, width));
+		}
+		return this.cachedLines;
+	}
+
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
+}
+
+function reuseText(context: JobToolRenderContext, text: string): Text {
+	const component = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+	component.setText(text);
+	return component;
+}
+
+function reuseWidthAware(
+	context: JobToolRenderContext,
+	renderer: (width: number) => string[],
+): WidthAwareToolComponent {
+	const component =
+		context.lastComponent instanceof WidthAwareToolComponent ? context.lastComponent : new WidthAwareToolComponent();
+	component.setRenderer(renderer);
+	return component;
+}
+
+function beginOperation(context: JobToolRenderContext): void {
+	if (context.executionStarted && context.state.operationStartedAt === undefined) {
+		context.state.operationStartedAt = Date.now();
+		context.state.operationEndedAt = undefined;
+	}
+}
+
+function operationFooter(context: JobToolRenderContext, isPartial: boolean, theme: Theme): string {
+	if (context.state.operationStartedAt === undefined) return "";
+	if (!isPartial || context.isError) context.state.operationEndedAt ??= Date.now();
+	const end = context.state.operationEndedAt ?? Date.now();
+	return `\n${theme.fg("muted", `${isPartial ? "Elapsed" : "Took"} ${formatDuration(end - context.state.operationStartedAt)}`)}`;
+}
+
+function renderCallTitle(context: JobToolRenderContext, theme: Theme, title: string, detail?: string): Text {
+	beginOperation(context);
+	const suffix = detail ? theme.fg("muted", ` ${detail}`) : "";
+	return reuseText(context, theme.fg("toolTitle", theme.bold(title)) + suffix);
+}
+
+function styleJobState(theme: Theme, job: Pick<JobSummary, "status" | "exitCode">): string {
+	if (job.status === "running") return theme.fg("accent", "running");
+	if (job.exitCode === 0) return theme.fg("success", "done");
+	return theme.fg("error", `failed (${job.exitCode ?? "?"})`);
+}
+
+function renderJobRows(theme: Theme, jobList: JobSummary[]): string {
+	if (jobList.length === 0) return theme.fg("muted", "No tracked jobs");
+	return jobList
+		.map(
+			(job) =>
+				`${styleJobState(theme, job)}  ${theme.fg("accent", job.name)}  ${theme.fg("muted", `pid ${job.pid} · ${formatJobAge(job)}`)}`,
+		)
+		.join("\n");
+}
+
+function textContent(result: { content: Array<{ type: string; text?: string }> }): string {
+	return result.content
+		.filter((part): part is { type: string; text: string } => part.type === "text" && typeof part.text === "string")
+		.map((part) => part.text)
+		.join("\n");
+}
+
+function renderJobOutput(
+	result: { content: Array<{ type: string; text?: string }>; details?: JobOutputDetails },
+	expanded: boolean,
+	isPartial: boolean,
+	theme: Theme,
+	context: JobToolRenderContext,
+): Component {
+	const details = result.details;
+	if (!details) {
+		return reuseText(
+			context,
+			theme.fg(context.isError ? "error" : "toolOutput", textContent(result)) +
+				operationFooter(context, isPartial, theme),
+		);
+	}
+	const output = details.outputs
+		.map((section) => (details.outputs.length > 1 ? `${section.label}:\n${section.content}` : section.content))
+		.filter(Boolean)
+		.join("\n");
+	return reuseWidthAware(context, (width) => {
+		const rows = [
+			truncateToWidth(
+				`${styleJobState(theme, details)}  ${theme.fg("accent", details.name)}  ${theme.fg("muted", `age ${formatJobAge(details)}`)}`,
+				width,
+				"...",
+			),
+		];
+		if (output) {
+			const styledOutput = output
+				.split("\n")
+				.map((line) => theme.fg("toolOutput", line))
+				.join("\n");
+			if (expanded) {
+				rows.push("", ...new Text(styledOutput, 0, 0).render(width));
+			} else {
+				const preview = truncateToVisualLines(styledOutput, JOB_OUTPUT_PREVIEW_LINES, width);
+				if (preview.skippedCount > 0) {
+					rows.push(
+						"",
+						truncateToWidth(
+							theme.fg("muted", `... ${preview.skippedCount} earlier lines (`) +
+								keyHint("app.tools.expand", "to expand") +
+								theme.fg("muted", ")"),
+							width,
+							"...",
+						),
+					);
+				} else {
+					rows.push("");
+				}
+				rows.push(...preview.visualLines);
+			}
+		} else {
+			rows.push(theme.fg("muted", "(no captured output)"));
+		}
+		const cursor = details.nextCursor ? ` · cursor ${JSON.stringify(details.nextCursor)}` : "";
+		const more = details.hasMore && Object.values(details.hasMore).some(Boolean) ? " · more available" : "";
+		rows.push(truncateToWidth(theme.fg("muted", `${details.outputs.reduce((sum, section) => sum + section.outputBytes, 0)} bytes${cursor}${more}`), width, "..."));
+		const footer = operationFooter(context, isPartial, theme);
+		if (footer) rows.push(...new Text(footer.slice(1), 0, 0).render(width));
+		return rows;
+	});
+}
+
 export default function powershellExtension(pi: ExtensionAPI) {
+	const reportJobCompletion = (job: JobRecord, ctx: ExtensionContext) => {
+		if (job.status !== "exited" || job.completionReported) return;
+		job.completionReported = true;
+		updateJobStatus(ctx);
+		if (shuttingDown || job.stopRequested) return;
+		const failed = job.exitCode !== 0;
+		ctx.ui.notify(
+			`PowerShell job '${job.name}' ${failed ? `failed with exit code ${job.exitCode ?? "unknown"}` : "completed successfully"}.`,
+			failed ? "error" : "info",
+		);
+		if (failed) {
+			const details: JobFailureDetails = {
+				name: job.name,
+				pid: job.pid,
+				exitCode: job.exitCode ?? -1,
+				endedAt: job.endedAt ?? Date.now(),
+			};
+			pi.sendMessage(
+				{
+					customType: JOB_FAILURE_MESSAGE_TYPE,
+					content: `PowerShell job '${job.name}' failed with exit code ${details.exitCode}. Use pwsh-get-job-output to inspect its output.`,
+					display: true,
+					details,
+				},
+				{ triggerTurn: false },
+			);
+		}
+	};
+
+	pi.registerMessageRenderer<JobFailureDetails>(JOB_FAILURE_MESSAGE_TYPE, (message, { expanded }, theme) => {
+		const details = message.details;
+		if (!details) return new Text(theme.fg("error", String(message.content)), 1, 0);
+		let text = theme.fg("error", theme.bold(`PowerShell job failed: ${details.name}`));
+		text += theme.fg("muted", ` · exit ${details.exitCode}`);
+		if (expanded) {
+			text += `\n${theme.fg("dim", `pid ${details.pid} · ${new Date(details.endedAt).toLocaleTimeString()}`)}`;
+			text += `\n${theme.fg("dim", `Use pwsh-get-job-output with name=${details.name} to inspect its output.`)}`;
+		}
+		return new Text(text, 1, 0);
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		shuttingDown = false;
+		updateJobStatus(ctx);
 		if (!IS_WINDOWS) return;
 
 		powershellAvailabilityPromise ??= probePowerShell();
@@ -645,7 +1013,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		return { operations: powershellOperations };
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		shuttingDown = true;
 		await Promise.allSettled(Array.from(startingJobOperations));
 		const errors: Error[] = [];
@@ -669,12 +1037,13 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				errors.push(new Error("Failed to remove the PowerShell job log directory during shutdown.", { cause: error }));
 			}
 		}
+		ctx.ui.setStatus(JOB_STATUS_KEY, undefined);
 		if (errors.length > 0) throw new AggregateError(errors, "PowerShell job cleanup failed during shutdown.");
 	});
 
-	const bashDefinition = createBashToolDefinition(process.cwd(), { operations: powershellOperations });
+	const powershellDefinition = createPowerShellToolDefinition(process.cwd(), { operations: powershellOperations });
 	pi.registerTool({
-		...bashDefinition,
+		...powershellDefinition,
 		name: "powershell",
 		label: "PowerShell",
 		description:
@@ -686,10 +1055,10 @@ export default function powershellExtension(pi: ExtensionAPI) {
 			"PowerShell 7 text cmdlets default to BOM-less UTF-8. Pass -Encoding explicitly for known legacy or non-UTF-8 files, configure native programs themselves to emit UTF-8, and redirect binary output to a file rather than returning it as text.",
 			"For failure-sensitive automation, set $ErrorActionPreference = 'Stop', consider $PSNativeCommandUseErrorActionPreference = $true, and inspect $LASTEXITCODE when appropriate; PowerShell can otherwise report success after an earlier non-terminating error.",
 			"Use pwsh-start-job (not powershell with a trailing background operator such as `command &`) when you need to run a dev server, test watcher, or any long-running process. pwsh-start-job survives across tool calls; a backgrounded powershell call does not.",
-			"Inspect PI_* environment variables for current model and session details.",
+			"You can inspect PI_* environment variables for current model and session details.",
 		],
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const definition = createBashToolDefinition(ctx.cwd, { operations: powershellOperations });
+			const definition = createPowerShellToolDefinition(ctx.cwd, { operations: powershellOperations });
 			return definition.execute(toolCallId, params, signal, onUpdate, ctx);
 		},
 	});
@@ -733,6 +1102,23 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				}),
 			),
 		}),
+		renderCall(args, theme, context) {
+			return renderCallTitle(
+				context,
+				theme,
+				`PowerShell job ${args.name || "..."}`,
+				`PS> ${args.command || "..."}`,
+			);
+		},
+		renderResult(result, { isPartial }, theme, context) {
+			const details = result.details as
+				| { name: string; pid: number; cwd: string; startedAt: number; status: "running" | "exited"; exitCode: number | null }
+				| undefined;
+			const text = details
+				? `${styleJobState(theme, details)}  ${theme.fg("accent", details.name)}  ${theme.fg("muted", `pid ${details.pid} · ${details.cwd}`)}`
+				: theme.fg(context.isError ? "error" : "toolOutput", textContent(result));
+			return reuseText(context, text + operationFooter(context, isPartial, theme));
+		},
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (shuttingDown) throw new Error(`Cannot start job '${params.name}' while the PowerShell extension is shutting down.`);
 			if (jobs.has(params.name) || startingJobs.has(params.name)) {
@@ -863,10 +1249,19 @@ export default function powershellExtension(pi: ExtensionAPI) {
 						outputDone,
 						outputError: pendingOutputError,
 						trackingStopped: false,
+						stopRequested: false,
+						completionReported: false,
 					};
 					jobs.set(params.name, record);
-					child.on("close", (code) => void trackProcessGroupExit(record!, code));
-					child.on("error", () => void record!.outputDone.then(() => markJobExited(record!)));
+					child.on("close", (code) =>
+						void trackProcessGroupExit(record!, code).then(() => reportJobCompletion(record!, ctx)),
+					);
+					child.on("error", () =>
+						void record!.outputDone.then(() => {
+							markJobExited(record!);
+							reportJobCompletion(record!, ctx);
+						}),
+					);
 				}
 				await new Promise<void>((resolveSpawn, rejectSpawn) => {
 					const onSpawn = () => {
@@ -892,6 +1287,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				}
 
 				child.unref();
+				updateJobStatus(ctx);
 
 				return {
 					content: [{ type: "text", text: `Started job '${params.name}' (pid ${child.pid}).\n\n${summarizeJob(record)}` }],
@@ -899,6 +1295,9 @@ export default function powershellExtension(pi: ExtensionAPI) {
 						name: params.name,
 						pid: child.pid,
 						cwd,
+						startedAt: record.startedAt,
+						status: record.status,
+						exitCode: record.exitCode,
 						mergedPath,
 						stdoutPath,
 						stderrPath,
@@ -912,6 +1311,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 						record.trackingStopped = true;
 						await removeJobFiles(record);
 						jobs.delete(record.name);
+						updateJobStatus(ctx);
 					} else {
 						if (child?.pid && !childHasExited(child) && !(await terminateProcessTree(child))) {
 							throw new Error(`Could not stop the untracked process for job '${params.name}'.`);
@@ -940,13 +1340,16 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		parameters: Type.Object({
 			name: Type.Optional(Type.String({ description: "Job name. Omit to list all jobs." })),
 		}),
+		renderCall(args, theme, context) {
+			return renderCallTitle(context, theme, args.name ? `PowerShell job ${args.name}` : "PowerShell jobs");
+		},
+		renderResult(result, { isPartial }, theme, context) {
+			const details = result.details as { jobs: JobSummary[]; job: JobSummary | null } | undefined;
+			const rows = details ? renderJobRows(theme, details.job ? [details.job] : details.jobs) : textContent(result);
+			return reuseText(context, rows + operationFooter(context, isPartial, theme));
+		},
 		async execute(_toolCallId, params) {
-			const listing = Array.from(jobs.values()).map((j) => ({
-				name: j.name,
-				status: j.status,
-				pid: j.pid,
-				exitCode: j.exitCode,
-			}));
+			const listing = Array.from(jobs.values(), toJobSummary);
 			if (!params.name) {
 				const text =
 					jobs.size === 0
@@ -965,17 +1368,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				content: [{ type: "text", text: summarizeJob(job) }],
 				details: {
 					jobs: listing,
-					job: {
-						name: job.name,
-						status: job.status,
-						pid: job.pid,
-						exitCode: job.exitCode,
-						startedAt: job.startedAt,
-						endedAt: job.endedAt,
-						mergedPath: job.mergedPath,
-						stdoutPath: job.stdoutPath,
-						stderrPath: job.stderrPath,
-					},
+					job: toJobSummary(job),
 				},
 			};
 		},
@@ -990,11 +1383,24 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		parameters: Type.Object({
 			name: Type.String({ description: "Job name to stop" }),
 		}),
-		async execute(_toolCallId, params) {
+		renderCall(args, theme, context) {
+			return renderCallTitle(context, theme, `Stop PowerShell job ${args.name || "..."}`);
+		},
+		renderResult(result, { isPartial }, theme, context) {
+			const details = result.details as
+				| { name: string; status: "running" | "exited"; exitCode: number | null; alreadyExited: boolean }
+				| undefined;
+			const text = details
+				? `${theme.fg(details.alreadyExited ? "muted" : "success", details.alreadyExited ? "already exited" : "stopped")}  ${theme.fg("accent", details.name)}${theme.fg("muted", ` · exit ${details.exitCode ?? "?"}`)}`
+				: theme.fg(context.isError ? "error" : "toolOutput", textContent(result));
+			return reuseText(context, text + operationFooter(context, isPartial, theme));
+		},
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const job = jobs.get(params.name);
 			if (!job) throw new Error(`No job named '${params.name}'.`);
 			const alreadyExited = job.status === "exited";
 			if (!alreadyExited) await stopJob(job);
+			updateJobStatus(ctx);
 			const text = alreadyExited
 				? `Job '${params.name}' already exited (code ${job.exitCode ?? "-"}).`
 				: `Stopped job '${params.name}'.\n\n${summarizeJob(job)}`;
@@ -1013,12 +1419,24 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		parameters: Type.Object({
 			name: Type.String({ description: "Job name to remove" }),
 		}),
-		async execute(_toolCallId, params) {
+		renderCall(args, theme, context) {
+			return renderCallTitle(context, theme, `Remove PowerShell job ${args.name || "..."}`);
+		},
+		renderResult(result, { isPartial }, theme, context) {
+			const details = result.details as { name: string; exitCode: number | null } | undefined;
+			const text = details
+				? `${theme.fg("success", "removed")}  ${theme.fg("accent", details.name)}${theme.fg("muted", ` · exit ${details.exitCode ?? "?"}`)}`
+				: theme.fg(context.isError ? "error" : "toolOutput", textContent(result));
+			return reuseText(context, text + operationFooter(context, isPartial, theme));
+		},
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const job = jobs.get(params.name);
 			if (!job) throw new Error(`No job named '${params.name}'.`);
 			if (job.status === "running") await stopJob(job);
 			await removeJobFiles(job);
+			job.trackingStopped = true;
 			jobs.delete(params.name);
+			updateJobStatus(ctx);
 			return {
 				content: [{ type: "text", text: `Removed job '${params.name}' (exit code ${job.exitCode ?? "-"}).` }],
 				details: { name: params.name, exitCode: job.exitCode },
@@ -1048,64 +1466,97 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				}),
 			),
 		}),
+		renderCall(args, theme, context) {
+			const mode = args.cursor === undefined ? "tail" : "from cursor";
+			return renderCallTitle(context, theme, `PowerShell output ${args.name || "..."}`, mode);
+		},
+		renderResult(result, { expanded, isPartial }, theme, context) {
+			return renderJobOutput(
+				result as { content: Array<{ type: string; text?: string }>; details?: JobOutputDetails },
+				expanded,
+				isPartial,
+				theme,
+				context,
+			);
+		},
 		async execute(_toolCallId, params) {
 			const job = jobs.get(params.name);
 			if (!job) throw new Error(`No job named '${params.name}'.`);
-			const incremental = params.cursor !== undefined;
-			const sections: string[] = [summarizeJob(job, params.full === true)];
-			const nextCursor: Partial<Record<"merged" | "stdout" | "stderr", number>> = {};
-			const hasMore: Partial<Record<"merged" | "stdout" | "stderr", boolean>> = {};
-			const appendOutput = async (slot: "merged" | "stdout" | "stderr", label: string, path: string) => {
-				if (incremental) {
-					const trunc = await readJobFileFromCursor(
-						path,
-						params.cursor?.[slot] ?? 0,
-						DEFAULT_MAX_LINES,
-						DEFAULT_MAX_BYTES,
-					);
-					if (trunc === null) {
-						nextCursor[slot] = params.cursor?.[slot] ?? 0;
-						hasMore[slot] = false;
-						sections.push(`(${label} log not yet created${params.full ? ` at ${path}` : ""})`);
-						return;
-					}
-					nextCursor[slot] = trunc.nextOffset;
-					hasMore[slot] = trunc.hasMore;
-					sections.push(
-						`${label} (cursor=${trunc.startOffset}->${trunc.nextOffset}, lines=${trunc.outputLines}, bytes=${trunc.outputBytes}/${trunc.totalBytes}, hasMore=${formatBool(trunc.hasMore)}):\n${trunc.content || "(no new output)"}`,
-					);
+			return getJobOutputResult(job, params);
+		},
+	});
+
+	pi.registerCommand("pwsh-jobs", {
+		description: "Interactively inspect, stop, or remove PowerShell background jobs",
+		handler: async (_args, ctx) => {
+			if (!ctx.hasUI) {
+				ctx.ui.notify("/pwsh-jobs requires an interactive UI.", "warning");
+				return;
+			}
+
+			while (true) {
+				const tracked = Array.from(jobs.values());
+				if (tracked.length === 0) {
+					ctx.ui.notify("No PowerShell jobs are currently tracked.", "info");
 					return;
 				}
-
-				const trunc = await readJobFile(path, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-				sections.push(
-					trunc === null
-						? `(${label} log not yet created${params.full ? ` at ${path}` : ""})`
-						: `${label} (truncated=${formatBool(trunc.truncated)}, lines=${trunc.outputLines}/${trunc.totalLinesKnown ? trunc.totalLines : "?"}, bytes=${trunc.outputBytes}/${trunc.totalBytes}):\n${trunc.content.trimEnd()}`,
+				const choices = new Map(
+					tracked.map((job) => [
+						`${job.name} · ${job.status === "running" ? "running" : job.exitCode === 0 ? "done" : `failed (${job.exitCode ?? "?"})`} · pid ${job.pid} · ${formatJobAge(job)}`,
+						job.name,
+					]),
 				);
-			};
+				const selected = await ctx.ui.select("PowerShell jobs", Array.from(choices.keys()));
+				if (!selected) return;
+				const name = choices.get(selected);
+				const job = name ? jobs.get(name) : undefined;
+				if (!job) {
+					ctx.ui.notify("That PowerShell job is no longer tracked. Refreshing the list.", "warning");
+					continue;
+				}
 
-			if (job.mergedPath) await appendOutput("merged", "merged output", job.mergedPath);
-			if (job.stdoutPath) await appendOutput("stdout", "stdout", job.stdoutPath);
-			if (job.stderrPath) await appendOutput("stderr", "stderr", job.stderrPath);
-			if (!job.mergedPath && !job.stdoutPath && !job.stderrPath) {
-				sections.push("(no log files — both streams were discarded)");
+				const viewOutput = "View output";
+				const stop = "Stop job";
+				const remove = "Remove job and owned logs";
+				const refresh = "Refresh jobs";
+				const close = "Close";
+				const action = await ctx.ui.select(`PowerShell job: ${job.name}`, [
+					viewOutput,
+					...(job.status === "running" ? [stop] : []),
+					remove,
+					refresh,
+					close,
+				]);
+				if (!action || action === close) return;
+				if (action === refresh) continue;
+				if (action === viewOutput) {
+					const output = await getJobOutputResult(job, {});
+					await ctx.ui.editor(`PowerShell output: ${job.name} (preview only)`, output.content[0].text);
+					continue;
+				}
+				if (action === stop) {
+					if (!(await ctx.ui.confirm("Stop PowerShell job?", `Stop '${job.name}' and its process tree?`))) continue;
+					await stopJob(job);
+					updateJobStatus(ctx);
+					ctx.ui.notify(`Stopped PowerShell job '${job.name}'.`, "info");
+					continue;
+				}
+				if (action === remove) {
+					if (
+						!(await ctx.ui.confirm(
+							"Remove PowerShell job?",
+							`Remove '${job.name}' from tracking${job.status === "running" ? ", stop its process tree," : ""} and delete logs owned by the extension?`,
+						))
+					)
+						continue;
+					if (job.status === "running") await stopJob(job);
+					await removeJobFiles(job);
+					job.trackingStopped = true;
+					jobs.delete(job.name);
+					updateJobStatus(ctx);
+					ctx.ui.notify(`Removed PowerShell job '${job.name}'.`, "info");
+				}
 			}
-			if (incremental) sections.push(`Next cursor: ${JSON.stringify(nextCursor)}`);
-
-			return {
-				content: [{ type: "text", text: sections.join("\n\n") }],
-				details: {
-					name: job.name,
-					status: job.status,
-					exitCode: job.exitCode,
-					mergedPath: params.full === true ? job.mergedPath : undefined,
-					stdoutPath: params.full === true ? job.stdoutPath : undefined,
-					stderrPath: params.full === true ? job.stderrPath : undefined,
-					nextCursor: incremental ? nextCursor : undefined,
-					hasMore: incremental ? hasMore : undefined,
-				},
-			};
 		},
 	});
 }

@@ -17,11 +17,25 @@ This checklist tracks the deep-review follow-up for `extensions/powershell.ts`.
 - [x] Decode stdout and stderr independently so interleaved chunks cannot corrupt split UTF-8 characters.
 - [x] Normalize foreground spill files and background logs to UTF-8 while removing one leading BOM per stream.
 - [x] Avoid decoding incomplete trailing UTF-8 characters while a live job log is being read.
+- [x] Spawn Windows `taskkill.exe` from the trusted absolute System32 path rather than searching `PATH`.
+
+## Pi 0.84 user experience
+
+- [x] Keep the extension's cross-platform execution, UTF-8, truncation, process-tree, and job-lifecycle implementation.
+- [x] Use Pi's PowerShell tool definition for semantic types and `PS>` foreground presentation without adopting its Windows-only executor.
+- [x] Add compact, width-aware call/result renderers for every background-job tool with Ctrl+O expansion.
+- [x] Show the newest five visual output lines when job output is collapsed and keep bounded output available when expanded.
+- [x] Separate tool-operation duration from the persistent background job's age.
+- [x] Add sticky running/failed/done job counts that remain visible in Pi's fullscreen layout.
+- [x] Notify on natural completion, persist natural failures without triggering an agent turn, and suppress those messages for explicit cleanup.
+- [x] Add `/pwsh-jobs` for interactive output viewing and confirmed stop/remove actions.
+- [x] Use the softer `You can inspect PI_*...` prompt guidance adopted by Pi's native PowerShell tool.
 
 ## Verification and distribution
 
 - [x] Add deterministic coverage for executable probing, shutdown races, quoting, paths, start validation, and exit codes.
 - [x] Add deterministic coverage for per-stream BOMs and split multibyte characters across foreground updates, spill files, and merged background logs.
+- [x] Add deterministic coverage for Pi 0.84 rendering, sticky job status, completion/failure messages, and the interactive job manager.
 - [x] Run type checking and deterministic PowerShell integration tests on Linux with PowerShell 7.6.4.
 - [x] Configure the integration workflow for both Ubuntu and native Windows runners.
 - [x] Bound the supported Pi and TypeBox versions to tested compatibility ranges.

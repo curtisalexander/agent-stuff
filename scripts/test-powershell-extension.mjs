@@ -6,10 +6,12 @@ import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { createJiti } from "jiti";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = resolve(dirname(scriptPath), "..");
+initTheme();
 const shell = process.env.POWERSHELL_BIN || "pwsh";
 if (process.argv.includes("--verify-unavailable-windows")) {
 	await verifyUnavailableWindowsFallback();
@@ -24,7 +26,14 @@ if (version.error || version.status !== 0) {
 
 const tools = new Map();
 const handlers = new Map();
+const commands = new Map();
+const messageRenderers = new Map();
 const notifications = [];
+const sentMessages = [];
+const statusUpdates = [];
+const editorViews = [];
+const selectResponses = [];
+const confirmResponses = [];
 let activeToolOverride = null;
 const pi = {
 	on(event, handler) {
@@ -32,6 +41,15 @@ const pi = {
 	},
 	registerTool(tool) {
 		tools.set(tool.name, tool);
+	},
+	registerCommand(name, command) {
+		commands.set(name, command);
+	},
+	registerMessageRenderer(customType, renderer) {
+		messageRenderers.set(customType, renderer);
+	},
+	sendMessage(message, options) {
+		sentMessages.push({ message, options });
 	},
 	getActiveTools() {
 		return activeToolOverride ?? ["bash", ...tools.keys()];
@@ -50,6 +68,8 @@ extension(pi);
 
 const ctx = {
 	cwd: repoRoot,
+	mode: "tui",
+	hasUI: true,
 	model: { provider: "openai", id: "powershell-test-model" },
 	thinkingLevel: "medium",
 	sessionManager: {
@@ -57,11 +77,56 @@ const ctx = {
 		getSessionFile: () => join(repoRoot, "powershell-test-session.jsonl"),
 	},
 	ui: {
+		async select(title, options) {
+			const response = selectResponses.shift();
+			return typeof response === "function" ? response(title, options) : response;
+		},
+		async confirm(title, message) {
+			const response = confirmResponses.shift();
+			return typeof response === "function" ? response(title, message) : (response ?? false);
+		},
+		async editor(title, prefill) {
+			editorViews.push({ title, prefill });
+			return undefined;
+		},
 		notify(message, level) {
 			notifications.push({ message, level });
 		},
+		setStatus(key, text) {
+			statusUpdates.push({ key, text });
+		},
 	},
 };
+
+const testTheme = {
+	fg(_color, text) {
+		return text;
+	},
+	bg(_color, text) {
+		return text;
+	},
+	bold(text) {
+		return text;
+	},
+};
+
+function createRenderContext(args, overrides = {}) {
+	return {
+		args,
+		toolCallId: "renderer-test",
+		invalidate() {},
+		lastComponent: undefined,
+		state: {},
+		cwd: repoRoot,
+		executionStarted: true,
+		argsComplete: true,
+		isPartial: false,
+		expanded: false,
+		showImages: false,
+		isError: false,
+		...overrides,
+	};
+}
 
 const foreground = requiredTool("powershell");
 const startedJobs = new Set();
@@ -69,6 +134,33 @@ const scratchDir = await mkdtemp(join(tmpdir(), "pi-powershell-test-"));
 let fullOutputPath;
 
 try {
+	assert(commands.has("pwsh-jobs"), "interactive PowerShell job manager command was not registered");
+	assert(messageRenderers.has("powershell-job-failed"), "PowerShell job failure renderer was not registered");
+	assert(
+		["pwsh-start-job", "pwsh-get-job", "pwsh-stop-job", "pwsh-remove-job", "pwsh-get-job-output"].every(
+			(name) => requiredTool(name).renderCall && requiredTool(name).renderResult,
+		),
+		"one or more PowerShell job tools did not register semantic renderers",
+	);
+	const foregroundRenderArgs = { command: "Write-Output renderer-check" };
+	const foregroundCall = foreground.renderCall(
+		foregroundRenderArgs,
+		testTheme,
+		createRenderContext(foregroundRenderArgs),
+	);
+	const foregroundCallText = foregroundCall.render(100).join("\n");
+	assert(foregroundCallText.includes("PS>"), "foreground rendering did not use Pi's PowerShell prompt");
+	assert(!foregroundCallText.includes("$ Write-Output"), "foreground rendering still used Pi's Bash prompt");
+	const startRenderArgs = { name: "renderer-job", command: "Write-Output renderer-check" };
+	const startCallText = requiredTool("pwsh-start-job")
+		.renderCall(startRenderArgs, testTheme, createRenderContext(startRenderArgs))
+		.render(100)
+		.join("\n");
+	assert(
+		startCallText.includes("renderer-job") && startCallText.includes("PS> Write-Output renderer-check"),
+		"background start renderer omitted the job name or PowerShell command",
+	);
+
 	assert(await probePowerShell(shell), "PowerShell availability probe rejected the configured executable");
 	assert(
 		!(await probePowerShell(join(scratchDir, "definitely-missing-pwsh"))),
@@ -396,6 +488,48 @@ Write-Output $value`,
 	);
 	assert(completedStatus.includes("Exit code: 0"), "completed background job had the wrong status");
 	assert(completedOutput.content[0].text.includes("job-finished"), "background job output was incomplete");
+	assert(completedOutput.details.outputs?.[0]?.content.includes("job-finished"), "semantic job output details were missing");
+	assert(
+		notifications.some(({ message, level }) => level === "info" && message.includes(completedJob) && message.includes("completed")),
+		"natural background completion notification was missing",
+	);
+	assert(
+		statusUpdates.some(({ key, text }) => key === "powershell-jobs" && text?.includes("done")),
+		"sticky job status did not report a completed job",
+	);
+	const outputRenderer = requiredTool("pwsh-get-job-output");
+	const outputRenderArgs = { name: completedJob };
+	const outputRenderState = { operationStartedAt: Date.now() - 1_250 };
+	const outputRenderContext = createRenderContext(outputRenderArgs, { state: outputRenderState });
+	const collapsedOutputComponent = outputRenderer.renderResult(
+		completedOutput,
+		{ expanded: false, isPartial: false },
+		testTheme,
+		outputRenderContext,
+	);
+	const collapsedOutputText = collapsedOutputComponent.render(70).join("\n");
+	assert(
+		collapsedOutputText.includes(completedJob) && collapsedOutputText.includes("job-finished") && collapsedOutputText.includes("Took"),
+		"collapsed output renderer omitted job state, newest output, or operation timing",
+	);
+	const reusedOutputComponent = outputRenderer.renderResult(
+		completedOutput,
+		{ expanded: false, isPartial: false },
+		testTheme,
+		createRenderContext(outputRenderArgs, { state: outputRenderState, lastComponent: collapsedOutputComponent }),
+	);
+	assert(reusedOutputComponent === collapsedOutputComponent, "job output renderer did not reuse its component");
+
+	selectResponses.push(
+		(_title, options) => options.find((option) => option.startsWith(`${completedJob} ·`)),
+		"View output",
+		undefined,
+	);
+	await commands.get("pwsh-jobs").handler("", ctx);
+	assert(
+		editorViews.some(({ title, prefill }) => title.includes(completedJob) && prefill.includes("job-finished")),
+		"interactive job manager did not show captured output",
+	);
 	assert(
 		!completedOutput.content[0].text.includes(completedStart.details.mergedPath) &&
 			completedOutput.details.mergedPath === undefined,
@@ -449,6 +583,27 @@ Write-Output $value`,
 	);
 	const failedStatus = await waitForJob(failedJob, "exited");
 	assert(failedStatus.includes("Exit code: 7"), "background nonzero exit code was not retained");
+	const failedMessage = sentMessages.find(({ message }) => message.details?.name === failedJob);
+	assert(
+		failedMessage?.message.customType === "powershell-job-failed" && failedMessage.options?.triggerTurn === false,
+		"natural background failure was not persisted without triggering a turn",
+	);
+	assert(
+		notifications.some(({ message, level }) => level === "error" && message.includes(failedJob)),
+		"natural background failure notification was missing",
+	);
+	assert(
+		statusUpdates.some(({ key, text }) => key === "powershell-jobs" && text?.includes("failed")),
+		"sticky job status did not report a failed job",
+	);
+	const failureMessageText = messageRenderers
+		.get("powershell-job-failed")(failedMessage.message, { expanded: true }, testTheme)
+		.render(100)
+		.join("\n");
+	assert(
+		failureMessageText.includes(failedJob) && failureMessageText.includes("exit 7") && failureMessageText.includes("pwsh-get-job-output"),
+		"durable failure renderer omitted recovery details",
+	);
 	await removeJob(failedJob);
 
 	const stoppedJob = `stop-${process.pid}`;
@@ -461,10 +616,43 @@ Write-Output $value`,
 		ctx,
 	);
 	await waitForOutput(stoppedJob, "ready");
-	await requiredTool("pwsh-stop-job").execute("stop", { name: stoppedJob });
+	await requiredTool("pwsh-stop-job").execute("stop", { name: stoppedJob }, undefined, undefined, ctx);
 	const stoppedStatus = await requiredTool("pwsh-get-job").execute("stop-status", { name: stoppedJob });
 	assert(stoppedStatus.content[0].text.includes("Status: exited"), "stopped job remained running");
+	assert(
+		!notifications.some(({ message }) => message.includes(stoppedJob) && message.includes("completed")),
+		"explicitly stopped job produced a natural-completion notification",
+	);
 	await removeJob(stoppedJob);
+
+	const managedJob = `managed-${process.pid}`;
+	startedJobs.add(managedJob);
+	await requiredTool("pwsh-start-job").execute(
+		"managed-start",
+		{ name: managedJob, command: "Write-Output managed-ready; Start-Sleep -Seconds 30" },
+		undefined,
+		undefined,
+		ctx,
+	);
+	await waitForOutput(managedJob, "managed-ready");
+	selectResponses.push(
+		(_title, options) => options.find((option) => option.startsWith(`${managedJob} ·`)),
+		"Stop job",
+		undefined,
+	);
+	confirmResponses.push(true);
+	await commands.get("pwsh-jobs").handler("", ctx);
+	const managedStopped = await requiredTool("pwsh-get-job").execute("managed-stopped", { name: managedJob });
+	assert(managedStopped.content[0].text.includes("Status: exited"), "interactive job manager did not stop the job");
+	selectResponses.push(
+		(_title, options) => options.find((option) => option.startsWith(`${managedJob} ·`)),
+		"Remove job and owned logs",
+	);
+	confirmResponses.push(true);
+	await commands.get("pwsh-jobs").handler("", ctx);
+	const afterManagedRemove = await requiredTool("pwsh-get-job").execute("managed-removed", {});
+	assert(afterManagedRemove.content[0].text === "No active jobs.", "interactive job manager did not remove the job");
+	startedJobs.delete(managedJob);
 
 	const directChildJob = `direct-child-${process.pid}`;
 	startedJobs.add(directChildJob);
@@ -601,6 +789,34 @@ Write-Output $value`,
 	assert(largeJobOutput.content[0].text.includes("truncated=yes"), "large background output was not truncated");
 	assert(largeJobOutput.content[0].text.includes("tail-🚀"), "large background output did not preserve its UTF-8 tail");
 	assert(largeJobOutput.content[0].text.length < 60_000, "large background output retrieval was not bounded");
+	const largeRenderArgs = { name: largeJob };
+	const largeRenderContext = createRenderContext(largeRenderArgs, {
+		state: { operationStartedAt: Date.now() - 500 },
+	});
+	const largeCollapsedComponent = outputRenderer.renderResult(
+		largeJobOutput,
+		{ expanded: false, isPartial: false },
+		testTheme,
+		largeRenderContext,
+	);
+	const largeCollapsedText = largeCollapsedComponent.render(60).join("\n");
+	assert(
+		largeCollapsedText.includes("tail-🚀") && largeCollapsedText.includes("earlier lines"),
+		"collapsed large-output renderer did not show the newest five-line preview",
+	);
+	const largeExpandedText = outputRenderer
+		.renderResult(
+			largeJobOutput,
+			{ expanded: true, isPartial: false },
+			testTheme,
+			createRenderContext(largeRenderArgs, { state: largeRenderContext.state }),
+		)
+		.render(60)
+		.join("\n");
+	assert(
+		largeExpandedText.length > largeCollapsedText.length && largeExpandedText.includes("tail-🚀"),
+		"expanded large-output renderer did not reveal the bounded full result",
+	);
 	let cursor = {};
 	let incrementalOutput = "";
 	let cursorChunks = 0;
@@ -638,7 +854,7 @@ Write-Output $value`,
 		undefined,
 		ctx,
 	);
-	const shutdown = handlers.get("session_shutdown")();
+	const shutdown = handlers.get("session_shutdown")({}, ctx);
 	const [racingResult, shutdownResult] = await Promise.allSettled([racingStart, shutdown]);
 	assert(racingResult.status === "rejected", "an in-flight job start survived extension shutdown");
 	assert(shutdownResult.status === "fulfilled", "extension shutdown failed while a job was starting");
@@ -646,6 +862,10 @@ Write-Output $value`,
 	assert(!existsSync(dirname(shutdownLog)), "session shutdown did not delete its owned job log directory");
 	const emptyJobs = await requiredTool("pwsh-get-job").execute("after-shutdown", {});
 	assert(emptyJobs.content[0].text === "No active jobs.", "session shutdown did not clear tracked jobs");
+	assert(
+		statusUpdates.at(-1)?.key === "powershell-jobs" && statusUpdates.at(-1)?.text === undefined,
+		"session shutdown did not clear sticky PowerShell job status",
+	);
 	startedJobs.delete(shutdownJob);
 	startedJobs.delete(racingJob);
 
@@ -661,7 +881,7 @@ Write-Output $value`,
 	);
 	await waitForJob(restartedJob, "exited");
 	await removeJob(restartedJob);
-	await handlers.get("session_shutdown")();
+	await handlers.get("session_shutdown")({}, ctx);
 	assert(!existsSync(dirname(restartedStart.details.mergedPath)), "restarted session log directory survived shutdown");
 
 	console.log(
@@ -679,6 +899,10 @@ Write-Output $value`,
 				interleavedForegroundUtf8: "passed",
 				strictErrors: "passed",
 				streamingUpdates,
+				powerShellRendering: "passed",
+				jobRenderers: "passed",
+				jobStatusAndNotifications: "passed",
+				interactiveJobManager: "passed",
 				nonzeroExit: "passed",
 				timeoutMs,
 				abort: "passed",
@@ -713,7 +937,7 @@ Write-Output $value`,
 	for (const name of startedJobs) {
 		await removeJob(name).catch(() => undefined);
 	}
-	await handlers.get("session_shutdown")().catch(() => undefined);
+	await handlers.get("session_shutdown")({}, ctx).catch(() => undefined);
 	if (fullOutputPath) await rm(fullOutputPath, { force: true }).catch(() => undefined);
 	await rm(scratchDir, { recursive: true, force: true });
 }
@@ -731,6 +955,9 @@ async function verifyUnavailableWindowsFallback() {
 		registerTool(tool) {
 			localTools.set(tool.name, tool);
 		},
+		registerCommand() {},
+		registerMessageRenderer() {},
+		sendMessage() {},
 		getActiveTools() {
 			return localActiveTools ?? ["bash", ...localTools.keys()];
 		},
@@ -746,6 +973,8 @@ async function verifyUnavailableWindowsFallback() {
 	localExtension(localPi);
 	const localCtx = {
 		cwd: repoRoot,
+		mode: "tui",
+		hasUI: true,
 		model: undefined,
 		thinkingLevel: undefined,
 		sessionManager: { getSessionId: () => undefined, getSessionFile: () => undefined },
@@ -753,6 +982,7 @@ async function verifyUnavailableWindowsFallback() {
 			notify(message, level) {
 				localNotifications.push({ message, level });
 			},
+			setStatus() {},
 		},
 	};
 	await localHandlers.get("session_start")({}, localCtx);
@@ -827,6 +1057,6 @@ async function waitForProcessExit(pid) {
 
 async function removeJob(name) {
 	if (!startedJobs.has(name)) return;
-	await requiredTool("pwsh-remove-job").execute("cleanup", { name });
+	await requiredTool("pwsh-remove-job").execute("cleanup", { name }, undefined, undefined, ctx);
 	startedJobs.delete(name);
 }

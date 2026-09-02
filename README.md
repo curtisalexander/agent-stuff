@@ -2,7 +2,7 @@
 
 Personal [Pi coding agent](https://pi.dev/) customizations, packaged for direct installation.
 
-This repository targets **Pi 0.83.x** (`@earendil-works/pi-coding-agent`) and Node.js 22.19 or newer. New Pi minor releases are enabled after the deterministic extension tests pass against them.
+This repository targets **Pi 0.84.x**, with 0.84.4 or newer in that release line (`@earendil-works/pi-coding-agent`), and Node.js 22.19 or newer. New Pi minor releases are enabled after the deterministic extension tests pass against them.
 
 Inspired in part by Armin Ronacher's `agent-stuff` repository:
 - https://github.com/mitsuhiko/agent-stuff
@@ -120,14 +120,20 @@ Adds a `powershell` tool plus a set of background-job tools (`pwsh-start-job`,
 - automatically preferring the `powershell` tool over `bash` on Windows after verifying that PowerShell 7 can launch
 - routing user-entered `!` and `!!` commands through PowerShell on Windows, with unavailable PowerShell tools disabled and Bash left unchanged when PowerShell 7 cannot launch
 - per-job environment-variable overrides and bounded cursor-based output consumption for long-running jobs
+- PowerShell-native `PS>` foreground rendering, streamed output previews, Ctrl+O expansion, and elapsed time using Pi 0.84's built-in presentation while retaining this extension's execution backend
+- compact, width-aware renderers for all background-job tools, including the newest five visual output lines when collapsed
+- sticky `pwsh: …` job counts in the status area, natural-completion notifications, and durable non-triggering transcript messages for failed jobs
+- `/pwsh-jobs`, an interactive job selector for viewing output and safely stopping or removing jobs
 
 The job-tool API shape is adapted from
 [`@marcfargas/pi-powershell`](https://github.com/marcfargas/pi-powershell) (MIT).
-Implementation is Node-native rather than PowerShell's `Start-Process`.
+Implementation is Node-native rather than PowerShell's `Start-Process`. Pi's PowerShell tool definition supplies the foreground presentation and semantic API types only: process execution, UTF-8 handling, truncation, cleanup, and background-job ownership remain implemented by this extension.
 
 Invoke long-running background programs directly, for example `npm run dev` or `dotnet watch`. Do not wrap them in `Start-Process`, `Start-Job`, a trailing background operator such as `command &`, or another self-detaching/backgrounding construct. PowerShell's `&` call operator is still appropriate for synchronous invocation. On Windows, `taskkill /T /F` can clean up descendants while the root `pwsh` remains alive, but Windows does not provide a durable process-tree handle through Node's standard child-process API after that root exits.
 
 Jobs survive tool calls, not extension-runtime replacement. Pi `/reload`, `/new`, `/resume`, `/fork`, and quit trigger session shutdown, which stops tracked jobs and deletes the extension-owned log directory. On Unix, that directory and its files are created with modes `0700` and `0600`, respectively. Caller-specified log files remain caller-owned and are preserved.
+
+The status area shows tracked job counts such as `pwsh: 2 running · 1 failed · 1 done`; in fullscreen mode Pi 0.84 keeps that area visible while the transcript scrolls independently. A naturally completed job raises a notification. A natural nonzero exit also adds a durable message without triggering an agent turn, so the failure is not lost if it occurs between prompts. Explicit stop, removal, and shutdown do not produce completion notifications. Run `/pwsh-jobs` to inspect jobs, preview output, stop a process tree, or remove a job and extension-owned logs; destructive actions require confirmation.
 
 Use `pwsh-start-job`'s `env` object for per-job environment variables. `pwsh-get-job-output` returns a bounded tail by default; pass `cursor: {}` to read from the beginning, then pass its returned `nextCursor` to consume subsequent chunks without gaps. Pass `full: true` only when raw log paths are needed.
 
@@ -151,7 +157,7 @@ npm run check
 npm run test:powershell
 ```
 
-`test:powershell` is a deterministic integration test that loads the extension, invokes real PowerShell without an LLM, and covers executable probing, Windows tool activation and unavailable-PowerShell fallback, user `!` command routing, multiline commands and quoting, UTF-8 input/output settings, BOM-less native pipeline input, deliberately split multibyte stdout interleaved with stderr, per-stream BOM removal, normalized merged job logs, strict errors, merged and separate stdout/stderr, streaming and spilled full output, Pi session and per-job environment variables, foreground and background nonzero exits, timeout/abort descendant cleanup, large-output tail and cursor reads, full-path opt-in, private log permissions, Unicode working directories, background start validation and duplicate prevention, background completion/stop, Unix descendant cleanup, custom-log preservation, shutdown racing an in-flight start, and job-directory cleanup across session restart.
+`test:powershell` is a deterministic integration test that loads the extension, invokes real PowerShell without an LLM, and covers executable probing, Windows tool activation and unavailable-PowerShell fallback, user `!` command routing, multiline commands and quoting, UTF-8 input/output settings, BOM-less native pipeline input, deliberately split multibyte stdout interleaved with stderr, per-stream BOM removal, normalized merged job logs, strict errors, merged and separate stdout/stderr, streaming and spilled full output, Pi session and per-job environment variables, foreground and background nonzero exits, timeout/abort descendant cleanup, large-output tail and cursor reads, full-path opt-in, private log permissions, Unicode working directories, background start validation and duplicate prevention, background completion/stop, Unix descendant cleanup, custom-log preservation, shutdown racing an in-flight start, job-directory cleanup across session restart, Pi 0.84 PowerShell/job rendering, sticky job status, completion/failure messages, and `/pwsh-jobs` view/stop/remove flows.
 
 The PowerShell workflow runs this suite on both Ubuntu and a native Windows runner. See `docs/powershell-hardening.md` for the platform-specific verification checklist and the condition that would justify a future Windows Job Object supervisor.
 
@@ -175,7 +181,7 @@ On Linux x64, install the pinned, checksum-verified PowerShell release without r
 npm run setup:powershell
 ```
 
-To test interactively through Pi 0.83 using the locally installed extension:
+To test interactively through Pi 0.84 using the locally installed extension:
 
 ```bash
 npm run pi -- -e ./extensions/powershell.ts
