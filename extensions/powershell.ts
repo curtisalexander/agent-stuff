@@ -19,8 +19,7 @@ import {
 import { Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, closeSync, openSync, writeSync } from "node:fs";
-import { access, chmod, mkdir, open, rm } from "node:fs/promises";
+import { access, chmod, mkdir, open, rm, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import type { Readable } from "node:stream";
@@ -123,13 +122,55 @@ function forwardUtf8Stream(stream: Readable, onData: (data: Buffer) => void): Pr
 	});
 }
 
-function writeAll(fd: number, data: Buffer): void {
+// Each stream awaits its write; pendingWrite serializes streams that share a log.
+interface JobLogSink {
+	file: FileHandle;
+	pendingWrite: Promise<void>;
+}
+
+async function writeAll(file: FileHandle, data: Buffer): Promise<void> {
 	let offset = 0;
 	while (offset < data.length) {
-		const written = writeSync(fd, data, offset, data.length - offset);
-		if (written === 0) throw new Error("Could not write captured PowerShell output.");
-		offset += written;
+		const { bytesWritten } = await file.write(data, offset, data.length - offset);
+		if (bytesWritten === 0) throw new Error("Could not write captured PowerShell output.");
+		offset += bytesWritten;
 	}
+}
+
+function writeJobLog(sink: JobLogSink, data: Buffer): Promise<void> {
+	const write = sink.pendingWrite.then(() => writeAll(sink.file, data));
+	sink.pendingWrite = write;
+	return write;
+}
+
+async function closeJobLog(sink: JobLogSink): Promise<void> {
+	try {
+		await sink.pendingWrite;
+	} finally {
+		await sink.file.close();
+	}
+}
+
+async function captureUtf8Stream(
+	stream: Readable,
+	sink: JobLogSink,
+	onError: (error: unknown) => void,
+): Promise<void> {
+	const decoder = new TextDecoder("utf-8");
+	let acceptingOutput = true;
+	const writeDecoded = async (text: string) => {
+		if (!text || !acceptingOutput) return;
+		try {
+			await writeJobLog(sink, Buffer.from(text, "utf8"));
+		} catch (error) {
+			acceptingOutput = false;
+			onError(error);
+		}
+	};
+	for await (const chunk of stream) {
+		await writeDecoded(decoder.decode(chunk, { stream: true }));
+	}
+	await writeDecoded(decoder.decode());
 }
 
 export function probePowerShell(shell = DEFAULT_SHELL): Promise<boolean> {
@@ -1131,7 +1172,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 			});
 			startingJobOperations.add(operation);
 			startingJobs.add(params.name);
-			const openedFds = new Set<number>();
+			const openLogSinks = new Set<JobLogSink>();
 			let child: ChildProcess | undefined;
 			let record: JobRecord | undefined;
 			let outputDone: Promise<void> | undefined;
@@ -1142,15 +1183,10 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				pendingOutputError ??= normalized;
 				if (record) record.outputError ??= normalized;
 			};
-			const closeOpenedFds = () => {
-				for (const fd of openedFds) {
-					try {
-						closeSync(fd);
-					} catch (error) {
-						setOutputError(error);
-					}
-				}
-				openedFds.clear();
+			const closeJobLogs = async () => {
+				const sinks = Array.from(openLogSinks);
+				openLogSinks.clear();
+				await Promise.all(sinks.map((sink) => closeJobLog(sink).catch(setOutputError)));
 			};
 			try {
 				const cwd = resolveWorkingDirectory(ctx.cwd, params.workingDirectory);
@@ -1168,44 +1204,52 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				const stdoutSpec = resolveJobStream(jobsDir, cwd, params.name, "stdout", params.stdout, bothDefault);
 				const stderrSpec = resolveJobStream(jobsDir, cwd, params.name, "stderr", params.stderr, bothDefault);
 				const mergedPath = bothDefault ? join(jobsDir, `${params.name}.log`) : null;
-				let stdoutFd: number | "ignore" = "ignore";
-				let stderrFd: number | "ignore" = "ignore";
+				let stdoutSink: JobLogSink | null = null;
+				let stderrSink: JobLogSink | null = null;
 				let stdoutPath: string | null = null;
 				let stderrPath: string | null = null;
 				const pathIsOwned = (path: string) =>
 					[stdoutSpec, stderrSpec]
 						.filter((spec): spec is Extract<JobStreamSpec, { kind: "file" }> => spec.kind === "file" && spec.path === path)
 						.every((spec) => spec.owned);
-				const openLog = (path: string, owned: boolean) => {
-					const fd = openSync(path, "w", owned ? 0o600 : 0o666);
-					if (owned && !IS_WINDOWS) chmodSync(path, 0o600);
-					openedFds.add(fd);
-					return fd;
+				const openJobLog = async (path: string, owned: boolean) => {
+					const file = await open(path, "w", owned ? 0o600 : 0o666);
+					const sinkHandle = { file, pendingWrite: Promise.resolve() };
+					openLogSinks.add(sinkHandle);
+					if (owned && !IS_WINDOWS) await file.chmod(0o600);
+					return sinkHandle;
 				};
 
 				if (mergedPath) {
-					stdoutFd = openLog(mergedPath, true);
-					stderrFd = stdoutFd;
-					ownedLogPaths = [mergedPath];
+					ownedLogPaths.push(mergedPath);
+					stdoutSink = await openJobLog(mergedPath, true);
+					stderrSink = stdoutSink;
 				} else {
 					if (stdoutSpec.kind === "file") {
 						stdoutPath = stdoutSpec.path;
-						const owned = pathIsOwned(stdoutPath);
-						stdoutFd = openLog(stdoutPath, owned);
-						if (owned) ownedLogPaths.push(stdoutPath);
+						const ownedStdoutLog = pathIsOwned(stdoutPath);
+						if (ownedStdoutLog) ownedLogPaths.push(stdoutPath);
+						stdoutSink = await openJobLog(stdoutPath, ownedStdoutLog);
 					}
 					if (stderrSpec.kind === "file") {
 						stderrPath = stderrSpec.path;
 						if (stderrPath === stdoutPath) {
-							stderrFd = stdoutFd;
+							stderrSink = stdoutSink;
 						} else {
-							const owned = pathIsOwned(stderrPath);
-							stderrFd = openLog(stderrPath, owned);
-							if (owned) ownedLogPaths.push(stderrPath);
+							const ownedStderrLog = pathIsOwned(stderrPath);
+							if (ownedStderrLog) ownedLogPaths.push(stderrPath);
+							stderrSink = await openJobLog(stderrPath, ownedStderrLog);
 						}
 					}
 				}
 
+				if (shuttingDown || signal?.aborted) {
+					throw new Error(
+						shuttingDown
+							? `Starting job '${params.name}' was interrupted by PowerShell extension shutdown.`
+							: `Starting job '${params.name}' was aborted.`,
+					);
+				}
 				child = spawn(
 					DEFAULT_SHELL,
 					["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", wrapCommand(params.command)],
@@ -1213,24 +1257,17 @@ export default function powershellExtension(pi: ExtensionAPI) {
 						cwd,
 						env: jobEnv,
 						detached: !IS_WINDOWS,
-						stdio: ["ignore", stdoutFd === "ignore" ? "ignore" : "pipe", stderrFd === "ignore" ? "ignore" : "pipe"],
+						stdio: ["ignore", stdoutSink ? "pipe" : "ignore", stderrSink ? "pipe" : "ignore"],
 						windowsHide: true,
 					},
 				);
-				const capture = (stream: Readable | null, fd: number | "ignore") => {
-					if (stream === null || fd === "ignore") return Promise.resolve();
-					return forwardUtf8Stream(stream, (data) => {
-						if (pendingOutputError) return;
-						try {
-							writeAll(fd, data);
-						} catch (error) {
-							setOutputError(error);
-						}
-					}).catch(setOutputError);
+				const capture = (stream: Readable | null, sink: JobLogSink | null) => {
+					if (stream === null || sink === null) return Promise.resolve();
+					return captureUtf8Stream(stream, sink, setOutputError).catch(setOutputError);
 				};
-				outputDone = Promise.all([capture(child.stdout, stdoutFd), capture(child.stderr, stderrFd)])
+				outputDone = Promise.all([capture(child.stdout, stdoutSink), capture(child.stderr, stderrSink)])
 					.then(() => undefined)
-					.finally(closeOpenedFds);
+					.finally(closeJobLogs);
 				if (child.pid) {
 					record = {
 						name: params.name,
@@ -1316,7 +1353,11 @@ export default function powershellExtension(pi: ExtensionAPI) {
 						if (child?.pid && !childHasExited(child) && !(await terminateProcessTree(child))) {
 							throw new Error(`Could not stop the untracked process for job '${params.name}'.`);
 						}
-						if (child && outputDone) await finishTerminatedOutput(child, outputDone);
+						if (child && outputDone) {
+							await finishTerminatedOutput(child, outputDone);
+						} else {
+							await closeJobLogs();
+						}
 						await Promise.allSettled(ownedLogPaths.map((path) => rm(path, { force: true })));
 					}
 				} catch (cleanupError) {
@@ -1324,7 +1365,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				}
 				throw error;
 			} finally {
-				if (!outputDone) closeOpenedFds();
+				if (!outputDone) await closeJobLogs();
 				startingJobs.delete(params.name);
 				completeOperation();
 				startingJobOperations.delete(operation);

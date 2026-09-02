@@ -546,6 +546,28 @@ Write-Output $value`,
 	);
 	await removeJob(completedJob);
 
+	const partialOpenJob = `partial-open-${process.pid}`;
+	const partialOpenLog = join(dirname(completedStart.details.mergedPath), `${partialOpenJob}-stdout.log`);
+	let partialOpenError = "";
+	try {
+		await requiredTool("pwsh-start-job").execute(
+			"partial-open-start",
+			{
+				name: partialOpenJob,
+				command: "Write-Output unreachable",
+				stdout: "default",
+				stderr: join(scratchDir, "missing-log-directory", "stderr.log"),
+			},
+			undefined,
+			undefined,
+			ctx,
+		);
+	} catch (error) {
+		partialOpenError = String(error);
+	}
+	assert(partialOpenError.length > 0, "background start accepted an invalid stderr log path");
+	assert(!existsSync(partialOpenLog), "a partially opened owned log survived background start failure");
+
 	const environmentJob = `environment-${process.pid}`;
 	startedJobs.add(environmentJob);
 	await requiredTool("pwsh-start-job").execute(
@@ -714,6 +736,26 @@ Write-Output $value`,
 	assert((await readFile(customLog, "utf8")).includes("caller-owned"), "caller-owned log capture was incomplete");
 	await removeJob(customLogJob);
 	assert(existsSync(customLog), "removing a job deleted its caller-owned log");
+
+	if (process.platform !== "win32" && existsSync("/dev/full")) {
+		const writeFailureJob = `write-failure-${process.pid}`;
+		startedJobs.add(writeFailureJob);
+		await requiredTool("pwsh-start-job").execute(
+			"write-failure-start",
+			{
+				name: writeFailureJob,
+				command: "[Console]::Out.Write(('x' * 1000000))",
+				stdout: "/dev/full",
+				stderr: "null",
+			},
+			undefined,
+			undefined,
+			ctx,
+		);
+		const writeFailureStatus = await waitForJob(writeFailureJob, "exited");
+		assert(writeFailureStatus.includes("Output capture error:"), "a background write failure was not reported");
+		await removeJob(writeFailureJob);
+	}
 
 	const separateStreamsJob = `streams-${process.pid}`;
 	startedJobs.add(separateStreamsJob);
@@ -918,6 +960,9 @@ Write-Output $value`,
 				descendantStop: process.platform === "win32" ? "not run on Windows" : "passed",
 				backgroundEnvironment: "passed",
 				backgroundEnvironmentOverride: "passed",
+				partialLogOpenCleanup: "passed",
+				failedLogWriteDrain:
+					process.platform === "win32" || !existsSync("/dev/full") ? "not supported" : "passed",
 				separateStreams: "passed",
 				mergedInterleavedUtf8: "passed",
 				boundedBackgroundTail: "passed",
