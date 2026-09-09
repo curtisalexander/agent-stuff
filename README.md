@@ -2,7 +2,7 @@
 
 Personal [Pi coding agent](https://pi.dev/) customizations, packaged for direct installation.
 
-This repository targets **Pi 0.84.x**, with 0.84.4 or newer in that release line (`@earendil-works/pi-coding-agent`), and Node.js 22.19 or newer. New Pi minor releases are enabled after the deterministic extension tests pass against them.
+This repository targets **Pi 0.85.x**, with 0.85.1 or newer in that release line (`@earendil-works/pi-coding-agent`), and Node.js 22.19 or newer. New Pi minor releases are enabled after the deterministic extension tests pass against them.
 
 Inspired in part by Armin Ronacher's `agent-stuff` repository:
 - https://github.com/mitsuhiko/agent-stuff
@@ -116,24 +116,30 @@ Adds a `powershell` tool plus a set of background-job tools (`pwsh-start-job`,
 - background processes (dev servers, watchers) that survive across tool calls in the current Pi session runtime
 - process-tree cleanup on timeout, cancellation, job removal, and Pi session shutdown
 - streaming partial output to the TUI as commands run
-- cross-platform PowerShell Core usage on macOS, Linux, and Windows
+- foreground PowerShell Core on macOS, Linux, and Windows; supervised background jobs on Linux and Windows
 - automatically preferring the `powershell` tool over `bash` on Windows after verifying that PowerShell 7 can launch
 - routing user-entered `!` and `!!` commands through PowerShell on Windows, with unavailable PowerShell tools disabled and Bash left unchanged when PowerShell 7 cannot launch
 - per-job environment-variable overrides and bounded cursor-based output consumption for long-running jobs
-- PowerShell-native `PS>` foreground rendering, streamed output previews, Ctrl+O expansion, and elapsed time using Pi 0.84's built-in presentation while retaining this extension's execution backend
+- PowerShell-native `PS>` foreground rendering, streamed output previews, Ctrl+O expansion, and elapsed time using Pi's built-in presentation while retaining this extension's execution backend
 - compact, width-aware renderers for all background-job tools, including the newest five visual output lines when collapsed
 - sticky `pwsh: …` job counts in the status area, natural-completion notifications, and durable non-triggering transcript messages for failed jobs
 - `/pwsh-jobs`, an interactive job selector for viewing output and safely stopping or removing jobs
 
 The job-tool API shape is adapted from
 [`@marcfargas/pi-powershell`](https://github.com/marcfargas/pi-powershell) (MIT).
-Implementation is Node-native rather than PowerShell's `Start-Process`. Pi's PowerShell tool definition supplies the foreground presentation and semantic API types only: process execution, UTF-8 handling, truncation, cleanup, and background-job ownership remain implemented by this extension.
+Implementation is Node-native rather than PowerShell's `Start-Process`. Pi's PowerShell tool definition supplies foreground presentation, current-session working directory and environment, streaming accumulation, truncation, and spill files. This extension owns process execution, UTF-8 decoding, process-tree cleanup, and background jobs and their bounded log reads.
 
-Invoke long-running background programs directly, for example `npm run dev` or `dotnet watch`. Do not wrap them in `Start-Process`, `Start-Job`, a trailing background operator such as `command &`, or another self-detaching/backgrounding construct. PowerShell's `&` call operator is still appropriate for synchronous invocation. On Windows, `taskkill /T /F` can clean up descendants while the root `pwsh` remains alive, but Windows does not provide a durable process-tree handle through Node's standard child-process API after that root exits.
+Background jobs require **Linux systemd user services** or **Windows Job Objects**. They refuse to start without containment; macOS currently supports only the foreground tool. Linux needs a working `systemctl --user` connection in the Pi process's environment and a Node.js-based Pi installation. Windows needs PowerShell 7 with permission to compile the bundled C# guardian and assign it to a Job Object; there is no native package/build-tool installation.
+
+Invoke long-running programs directly, for example `npm run dev` or `dotnet watch`. The root PowerShell process defines the job lifetime: when it exits, all contained descendants are terminated, including ordinary detached children. PowerShell's `&` call operator is appropriate for synchronous invocation. Jobs must not delegate work to external brokers such as WMI, scheduled tasks, another service manager, or a container daemon; those processes are outside the job container. This is lifecycle containment, not a security sandbox against code running as the same user.
 
 Jobs survive tool calls, not extension-runtime replacement. Pi `/reload`, `/new`, `/resume`, `/fork`, and quit trigger session shutdown, which stops tracked jobs and deletes the extension-owned log directory. On Unix, that directory and its files are created with modes `0700` and `0600`, respectively. Caller-specified log files remain caller-owned and are preserved.
 
-The status area shows tracked job counts such as `pwsh: 2 running · 1 failed · 1 done`; in fullscreen mode Pi 0.84 keeps that area visible while the transcript scrolls independently. A naturally completed job raises a notification. A natural nonzero exit also adds a durable message without triggering an agent turn, so the failure is not lost if it occurs between prompts. Explicit stop, removal, and shutdown do not produce completion notifications. Run `/pwsh-jobs` to inspect jobs, preview output, stop a process tree, or remove a job and extension-owned logs; destructive actions require confirmation.
+Each background job has a guardian and a private lifetime socket connected to Pi. Pi death closes the socket and ends the guardian. Guardian death ends its systemd service (Linux) or closes the last kill-on-close Job Object handle (Windows), terminating contained descendants even if they changed process group or session. Linux allows three seconds for SIGTERM before SIGKILL; Windows Job Object termination is immediate. No stale-PID recovery or global process exception handlers are used. A hard crash can leave bounded temporary logs/control directories for inspection; the next Pi process does not adopt old jobs or delete those files. Foreground execution retains its separate, best-effort process-tree cancellation contract.
+
+Captured background logs have a **10 MiB combined stdout/stderr limit per job**, including caller-specified destinations. Set `maxLogBytes` explicitly (1 byte through 1 GiB) for a different limit. Quota exhaustion or a write failure stops the whole job and reports an output-capture failure, even if the process exits with code 0. The captured prefix is preserved without splitting valid UTF-8 characters; no rotation resets cursor offsets. Discarded streams do not consume the budget. This cap does not limit files a command writes directly or foreground spill files.
+
+The status area shows tracked job counts such as `pwsh: 2 running · 1 failed · 1 done`; in fullscreen mode Pi keeps that area visible while the transcript scrolls independently. A naturally completed job raises a notification. A natural nonzero exit also adds a durable message without triggering an agent turn, so the failure is not lost if it occurs between prompts. Explicit stop, removal, and shutdown do not produce completion notifications. Run `/pwsh-jobs` to inspect jobs, preview output, stop a process tree, or remove a job and extension-owned logs; destructive actions require confirmation.
 
 Use `pwsh-start-job`'s `env` object for per-job environment variables. `pwsh-get-job-output` returns a bounded tail by default; pass `cursor: {}` to read from the beginning, then pass its returned `nextCursor` to consume subsequent chunks without gaps. Pass `full: true` only when raw log paths are needed.
 
@@ -154,12 +160,17 @@ $PSNativeCommandUseErrorActionPreference = $true
 ```bash
 npm install
 npm run check
+npm run test:powershell:supervisor
 npm run test:powershell
 ```
 
 `test:powershell` is a deterministic integration test that loads the extension, invokes real PowerShell without an LLM, and covers executable probing, Windows tool activation and unavailable-PowerShell fallback, user `!` command routing, multiline commands and quoting, UTF-8 input/output settings, BOM-less native pipeline input, deliberately split multibyte stdout interleaved with stderr, per-stream BOM removal, normalized merged job logs, strict errors, merged and separate stdout/stderr, streaming and spilled full output, Pi session and per-job environment variables, foreground and background nonzero exits, timeout/abort descendant cleanup, large-output tail and cursor reads, full-path opt-in, private log permissions, Unicode working directories, background start validation and duplicate prevention, background completion/stop, Unix descendant cleanup, custom-log preservation, shutdown racing an in-flight start, job-directory cleanup across session restart, Pi 0.84 PowerShell/job rendering, sticky job status, completion/failure messages, and `/pwsh-jobs` view/stop/remove flows.
 
-The PowerShell workflow runs this suite on both Ubuntu and a native Windows runner. See `docs/powershell-hardening.md` for the platform-specific verification checklist and the condition that would justify a future Windows Job Object supervisor.
+Additional regressions cover owned-log name collisions, concurrent stop/removal and name reuse, stale UI confirmations, abrupt root-process termination, SIGTERM-resistant children, missing Windows `taskkill`, runtime `ctx.cwd`, and exact cursor-output reconstruction. Output readiness checks inspect captured output, not the echoed command.
+
+The PowerShell workflow requires both suites on Ubuntu and native Windows. The supervisor suite kills real owner/guardian processes, checks detached-descendant termination and unrelated-process survival, and verifies fail-closed startup and cancellation. Do not release the supervisor change until the native Windows gate passes. See `docs/powershell-hardening.md` for the contract and verification record.
+
+In an orb or CI session without a user login, an administrator may need to start the user manager first. For this Linux orb, run `sudo systemctl start "user@$(id -u).service"`, then prefix test/Pi commands with `XDG_RUNTIME_DIR="/run/user/$(id -u)"`. The extension never elevates privileges or starts a system manager itself.
 
 After configuring a model in Pi, run the model-driven integration test with:
 
@@ -181,7 +192,7 @@ On Linux x64, install the pinned, checksum-verified PowerShell release without r
 npm run setup:powershell
 ```
 
-To test interactively through Pi 0.84 using the locally installed extension:
+To test interactively through Pi 0.85 using the locally installed extension:
 
 ```bash
 npm run pi -- -e ./extensions/powershell.ts

@@ -2,7 +2,7 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -136,6 +136,14 @@ let fullOutputPath;
 try {
 	assert(commands.has("pwsh-jobs"), "interactive PowerShell job manager command was not registered");
 	assert(messageRenderers.has("powershell-job-failed"), "PowerShell job failure renderer was not registered");
+	const maxLogSchema = requiredTool("pwsh-start-job").parameters.properties.maxLogBytes;
+	assert(
+		maxLogSchema.minimum === 1 &&
+			maxLogSchema.maximum === 1024 * 1024 * 1024 &&
+			maxLogSchema.type === "integer" &&
+			maxLogSchema.description.includes("default 10 MiB"),
+		"maxLogBytes did not advertise its 10 MiB default and integer 1..1 GiB bounds",
+	);
 	assert(
 		["pwsh-start-job", "pwsh-get-job", "pwsh-stop-job", "pwsh-remove-job", "pwsh-get-job-output"].every(
 			(name) => requiredTool(name).renderCall && requiredTool(name).renderResult,
@@ -380,6 +388,38 @@ Write-Output $value`,
 	assert(Number.isInteger(abortChildPid), "foreground abort did not capture its descendant process id");
 	await waitForProcessExit(abortChildPid);
 
+	if (process.platform === "win32") {
+		const systemRoot = process.env.SystemRoot;
+		const missingTaskkillAbort = new AbortController();
+		let rootPid;
+		let missingTaskkillError = "";
+		const startedAt = Date.now();
+		try {
+			await foreground.execute(
+				"missing-taskkill",
+				{ command: 'Write-Output "fallback-root=$PID"; Start-Sleep -Seconds 30' },
+				missingTaskkillAbort.signal,
+				(update) => {
+					const match = update.content[0]?.text?.match(/fallback-root=(\d+)/);
+					if (!match || rootPid) return;
+					rootPid = Number(match[1]);
+					// Change lookup only after PowerShell has initialized successfully.
+					process.env.SystemRoot = join(scratchDir, "missing-system-root");
+					missingTaskkillAbort.abort();
+				},
+				ctx,
+			);
+		} catch (error) {
+			missingTaskkillError = String(error);
+		} finally {
+			if (systemRoot === undefined) delete process.env.SystemRoot;
+			else process.env.SystemRoot = systemRoot;
+		}
+		assert(rootPid && Date.now() - startedAt < 10_000, "missing taskkill left foreground cancellation waiting");
+		assert(missingTaskkillError.includes("Could not stop the PowerShell process tree"), "failed tree cleanup was hidden");
+		await waitForProcessExit(rootPid);
+	}
+
 	const large = await foreground.execute(
 		"large",
 		{ command: '1..3000 | ForEach-Object { "line-$_" }' },
@@ -394,6 +434,14 @@ Write-Output $value`,
 
 	const unicodeCwd = join(scratchDir, "working directory 雪");
 	await mkdir(unicodeCwd);
+	const foregroundCwd = await foreground.execute(
+		"runtime-cwd",
+		{ command: "Write-Output (Get-Location).Path" },
+		undefined,
+		undefined,
+		{ ...ctx, cwd: unicodeCwd },
+	);
+	assert(foregroundCwd.content[0].text.trim() === unicodeCwd, "Pi's tool definition ignored runtime ctx.cwd");
 	const cwdJob = `cwd-${process.pid}`;
 	startedJobs.add(cwdJob);
 	await requiredTool("pwsh-start-job").execute(
@@ -547,7 +595,8 @@ Write-Output $value`,
 	await removeJob(completedJob);
 
 	const partialOpenJob = `partial-open-${process.pid}`;
-	const partialOpenLog = join(dirname(completedStart.details.mergedPath), `${partialOpenJob}-stdout.log`);
+	const ownedLogDirectory = dirname(completedStart.details.mergedPath);
+	const ownedLogsBeforePartialOpen = await readdir(ownedLogDirectory);
 	let partialOpenError = "";
 	try {
 		await requiredTool("pwsh-start-job").execute(
@@ -566,7 +615,92 @@ Write-Output $value`,
 		partialOpenError = String(error);
 	}
 	assert(partialOpenError.length > 0, "background start accepted an invalid stderr log path");
-	assert(!existsSync(partialOpenLog), "a partially opened owned log survived background start failure");
+	const ownedLogsAfterPartialOpen = await readdir(ownedLogDirectory);
+	assert(
+		JSON.stringify(ownedLogsAfterPartialOpen.sort()) === JSON.stringify(ownedLogsBeforePartialOpen.sort()),
+		"a partially opened owned log survived background start failure",
+	);
+
+	const collisionBaseJob = `owned-collision-${process.pid}`;
+	const collisionSuffixJob = `${collisionBaseJob}-stdout`;
+	startedJobs.add(collisionBaseJob);
+	const collisionBaseStart = await requiredTool("pwsh-start-job").execute(
+		"owned-collision-base-start",
+		{
+			name: collisionBaseJob,
+			command: "Write-Output collision-base-marker",
+			stdout: "default",
+			stderr: "null",
+		},
+		undefined,
+		undefined,
+		ctx,
+	);
+	await waitForJob(collisionBaseJob, "exited");
+	startedJobs.add(collisionSuffixJob);
+	const collisionSuffixStart = await requiredTool("pwsh-start-job").execute(
+		"owned-collision-suffix-start",
+		{ name: collisionSuffixJob, command: "Write-Output collision-suffix-marker" },
+		undefined,
+		undefined,
+		ctx,
+	);
+	await waitForJob(collisionSuffixJob, "exited");
+	assert(
+		collisionBaseStart.details.stdoutPath !== collisionSuffixStart.details.mergedPath,
+		"owned jobs with colliding legacy names shared a log path",
+	);
+	const collisionBaseLog = await readFile(collisionBaseStart.details.stdoutPath, "utf8");
+	const collisionSuffixLog = await readFile(collisionSuffixStart.details.mergedPath, "utf8");
+	assert(
+		collisionBaseLog.includes("collision-base-marker") && !collisionBaseLog.includes("collision-suffix-marker"),
+		"the first colliding owned log contained another job's output",
+	);
+	assert(
+		collisionSuffixLog.includes("collision-suffix-marker") && !collisionSuffixLog.includes("collision-base-marker"),
+		"the second colliding owned log contained another job's output",
+	);
+	await removeJob(collisionBaseJob);
+	assert(
+		existsSync(collisionSuffixStart.details.mergedPath) &&
+			(await readFile(collisionSuffixStart.details.mergedPath, "utf8")).includes("collision-suffix-marker"),
+		"removing one colliding job deleted the other job's owned log",
+	);
+	await removeJob(collisionSuffixJob);
+	if (process.platform === "win32") {
+		const caseUpperJob = `Owned-Case-${process.pid}`;
+		const caseLowerJob = caseUpperJob.toLowerCase();
+		startedJobs.add(caseUpperJob);
+		const caseUpperStart = await requiredTool("pwsh-start-job").execute(
+			"owned-case-upper-start",
+			{ name: caseUpperJob, command: "Write-Output case-upper-marker" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		await waitForJob(caseUpperJob, "exited");
+		startedJobs.add(caseLowerJob);
+		const caseLowerStart = await requiredTool("pwsh-start-job").execute(
+			"owned-case-lower-start",
+			{ name: caseLowerJob, command: "Write-Output case-lower-marker" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		await waitForJob(caseLowerJob, "exited");
+		assert(
+			caseUpperStart.details.mergedPath.toLowerCase() !== caseLowerStart.details.mergedPath.toLowerCase(),
+			"case-variant Windows job names shared an owned log path",
+		);
+		assert(
+			(await readFile(caseUpperStart.details.mergedPath, "utf8")).includes("case-upper-marker") &&
+				(await readFile(caseLowerStart.details.mergedPath, "utf8")).includes("case-lower-marker"),
+			"case-variant Windows job logs did not retain distinct output",
+		);
+		await removeJob(caseUpperJob);
+		assert(existsSync(caseLowerStart.details.mergedPath), "removing a case-variant job deleted its peer's log");
+		await removeJob(caseLowerJob);
+	}
 
 	const environmentJob = `environment-${process.pid}`;
 	startedJobs.add(environmentJob);
@@ -628,6 +762,27 @@ Write-Output $value`,
 	);
 	await removeJob(failedJob);
 
+	const crashedRootJob = `root-crash-${process.pid}`;
+	startedJobs.add(crashedRootJob);
+	const failureMessagesBeforeCrash = sentMessages.filter(({ message }) => message.details?.name === crashedRootJob).length;
+	await requiredTool("pwsh-start-job").execute(
+		"root-crash-start",
+		{ name: crashedRootJob, command: 'Write-Output root-crash-ready; [System.Diagnostics.Process]::GetCurrentProcess().Kill()' },
+		undefined,
+		undefined,
+		ctx,
+	);
+	const crashedRootStatus = await waitForJob(crashedRootJob, "exited");
+	assert(!crashedRootStatus.includes("Exit code: 0"), "unexpected root PowerShell crash was reported as success");
+	await new Promise((resolveWait) => setTimeout(resolveWait, 500));
+	const rootCrashFailureMessages = sentMessages.filter(({ message }) => message.details?.name === crashedRootJob);
+	assert(
+		rootCrashFailureMessages.length === failureMessagesBeforeCrash + 1 &&
+			rootCrashFailureMessages.at(-1)?.message.customType === "powershell-job-failed",
+		"unexpected root PowerShell crash did not produce exactly one durable failure",
+	);
+	await removeJob(crashedRootJob);
+
 	const stoppedJob = `stop-${process.pid}`;
 	startedJobs.add(stoppedJob);
 	await requiredTool("pwsh-start-job").execute(
@@ -646,6 +801,49 @@ Write-Output $value`,
 		"explicitly stopped job produced a natural-completion notification",
 	);
 	await removeJob(stoppedJob);
+
+	const concurrentRemovalJob = `concurrent-remove-${process.pid}`;
+	startedJobs.add(concurrentRemovalJob);
+	await requiredTool("pwsh-start-job").execute(
+		"concurrent-remove-start",
+		{
+			name: concurrentRemovalJob,
+			command: `& '${quotedNode}' -e 'console.log("concurrent-child=" + process.pid); setTimeout(() => {}, 30000)'`,
+		},
+		undefined,
+		undefined,
+		ctx,
+	);
+	const concurrentRemovalOutput = await waitForOutputMatch(concurrentRemovalJob, /concurrent-child=(\d+)/);
+	const concurrentRemovalPid = Number(concurrentRemovalOutput.match(/concurrent-child=(\d+)/)?.[1]);
+	assert(Number.isInteger(concurrentRemovalPid), "could not capture the concurrently removed job's child pid");
+	const concurrentRemovalResults = await Promise.allSettled([
+		requiredTool("pwsh-stop-job").execute("concurrent-stop", { name: concurrentRemovalJob }),
+		requiredTool("pwsh-remove-job").execute("concurrent-remove-first", { name: concurrentRemovalJob }),
+		requiredTool("pwsh-remove-job").execute("concurrent-remove-second", { name: concurrentRemovalJob }),
+	]);
+	assert(
+		concurrentRemovalResults.every(({ status }) => status === "fulfilled"),
+		"concurrent stop/removes of one running job did not all settle successfully",
+	);
+	startedJobs.delete(concurrentRemovalJob);
+	await waitForProcessExit(concurrentRemovalPid);
+	const afterConcurrentRemoval = await requiredTool("pwsh-get-job").execute("concurrent-removed", {});
+	assert(afterConcurrentRemoval.content[0].text === "No active jobs.", "concurrent removal left the job tracked");
+	startedJobs.add(concurrentRemovalJob);
+	await requiredTool("pwsh-start-job").execute(
+		"concurrent-remove-restart",
+		{ name: concurrentRemovalJob, command: "Write-Output concurrent-restart-marker; Start-Sleep -Seconds 30" },
+		undefined,
+		undefined,
+		ctx,
+	);
+	await waitForOutput(concurrentRemovalJob, "concurrent-restart-marker");
+	const concurrentRestartStatus = await requiredTool("pwsh-get-job").execute("concurrent-restart-status", {
+		name: concurrentRemovalJob,
+	});
+	assert(concurrentRestartStatus.content[0].text.includes("Status: running"), "immediate same-name restart was not tracked");
+	await removeJob(concurrentRemovalJob);
 
 	const managedJob = `managed-${process.pid}`;
 	startedJobs.add(managedJob);
@@ -676,6 +874,50 @@ Write-Output $value`,
 	assert(afterManagedRemove.content[0].text === "No active jobs.", "interactive job manager did not remove the job");
 	startedJobs.delete(managedJob);
 
+	const staleConfirmationJob = `stale-confirm-${process.pid}`;
+	startedJobs.add(staleConfirmationJob);
+	await requiredTool("pwsh-start-job").execute(
+		"stale-confirm-old-start",
+		{ name: staleConfirmationJob, command: "Write-Output stale-old-marker" },
+		undefined,
+		undefined,
+		ctx,
+	);
+	await waitForJob(staleConfirmationJob, "exited");
+	selectResponses.push(
+		(_title, options) => options.find((option) => option.startsWith(`${staleConfirmationJob} ·`)),
+		"Remove job and owned logs",
+	);
+	let staleReplacementStart;
+	confirmResponses.push(async () => {
+		await requiredTool("pwsh-remove-job").execute("stale-confirm-remove-old", { name: staleConfirmationJob });
+		startedJobs.delete(staleConfirmationJob);
+		startedJobs.add(staleConfirmationJob);
+		staleReplacementStart = await requiredTool("pwsh-start-job").execute(
+			"stale-confirm-replacement-start",
+			{ name: staleConfirmationJob, command: "Write-Output stale-replacement-marker; Start-Sleep -Seconds 30" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		await waitForOutput(staleConfirmationJob, "stale-replacement-marker");
+		return true;
+	});
+	await commands.get("pwsh-jobs").handler("", ctx);
+	const staleReplacementStatus = await requiredTool("pwsh-get-job").execute("stale-confirm-status", {
+		name: staleConfirmationJob,
+	});
+	assert(staleReplacementStatus.content[0].text.includes("Status: running"), "stale UI removal removed the replacement job");
+	assert(
+		staleReplacementStart?.details.mergedPath && existsSync(staleReplacementStart.details.mergedPath),
+		"stale UI removal deleted the replacement job's owned log",
+	);
+	assert(
+		(await readFile(staleReplacementStart.details.mergedPath, "utf8")).includes("stale-replacement-marker"),
+		"replacement output was missing after stale UI removal",
+	);
+	await removeJob(staleConfirmationJob);
+
 	const directChildJob = `direct-child-${process.pid}`;
 	startedJobs.add(directChildJob);
 	await requiredTool("pwsh-start-job").execute(
@@ -696,6 +938,31 @@ Write-Output $value`,
 	await removeJob(directChildJob);
 
 	if (process.platform !== "win32") {
+		const resistantChildJob = `sigterm-resistant-${process.pid}`;
+		startedJobs.add(resistantChildJob);
+		await requiredTool("pwsh-start-job").execute(
+			"sigterm-resistant-start",
+			{
+				name: resistantChildJob,
+				command: `& '${quotedNode}' -e 'process.on("SIGTERM",()=>{}); console.log("resistant-child=" + process.pid); console.log("resistant-ready"); setInterval(()=>{},1000)'`,
+			},
+			undefined,
+			undefined,
+			ctx,
+		);
+		const resistantOutput = await waitForOutputMatch(resistantChildJob, /resistant-child=(\d+)[\s\S]*resistant-ready/);
+		const resistantChildPid = Number(resistantOutput.match(/resistant-child=(\d+)/)?.[1]);
+		assert(Number.isInteger(resistantChildPid), "could not capture the SIGTERM-resistant direct child's pid");
+		const resistantStopStartedAt = Date.now();
+		await requiredTool("pwsh-stop-job").execute("sigterm-resistant-stop", { name: resistantChildJob });
+		const resistantStopMs = Date.now() - resistantStopStartedAt;
+		assert(
+			resistantStopMs >= 2_500 && resistantStopMs < 9_000,
+			`SIGTERM-resistant stop did not use the bounded escalation window: ${resistantStopMs}ms`,
+		);
+		await waitForProcessExit(resistantChildPid);
+		await removeJob(resistantChildJob);
+
 		const descendantJob = `descendant-${process.pid}`;
 		startedJobs.add(descendantJob);
 		await requiredTool("pwsh-start-job").execute(
@@ -712,12 +979,8 @@ Write-Output $value`,
 		const descendantOutput = await waitForOutputMatch(descendantJob, /child-pid=(\d+)/);
 		const descendantPid = Number(descendantOutput.match(/child-pid=(\d+)/)?.[1]);
 		assert(Number.isInteger(descendantPid), "could not capture the descendant process id");
-		await new Promise((resolveWait) => setTimeout(resolveWait, 300));
-		const descendantStatus = await requiredTool("pwsh-get-job").execute("descendant-status", {
-			name: descendantJob,
-		});
-		assert(descendantStatus.content[0].text.includes("Status: running"), "job lost track of its live descendant");
-		await requiredTool("pwsh-stop-job").execute("descendant-stop", { name: descendantJob });
+		const descendantStatus = await waitForJob(descendantJob, "exited");
+		assert(descendantStatus.includes("Exit code: 0"), "root exit did not naturally complete the whole supervised job");
 		await waitForProcessExit(descendantPid);
 		await removeJob(descendantJob);
 	}
@@ -737,6 +1000,128 @@ Write-Output $value`,
 	await removeJob(customLogJob);
 	assert(existsSync(customLog), "removing a job deleted its caller-owned log");
 
+	// Quotas count the combined captured UTF-8 bytes, retain only whole characters, and fail the job durably.
+	const defaultQuotaJob = `quota-default-${process.pid}`;
+	startedJobs.add(defaultQuotaJob);
+	const defaultQuotaStart = await requiredTool("pwsh-start-job").execute(
+		"quota-default-start",
+		{ name: defaultQuotaJob, command: "[Console]::Out.Write(('x' * 11534336)); Start-Sleep -Seconds 30" },
+		undefined, undefined, ctx,
+	);
+	await waitForJob(defaultQuotaJob, "exited");
+	assert((await stat(defaultQuotaStart.details.mergedPath)).size === 10 * 1024 * 1024, "default job quota did not cap actual captured output at 10 MiB");
+	const defaultQuotaStatus = await requiredTool("pwsh-get-job").execute("quota-default-details", { name: defaultQuotaJob });
+	assert(defaultQuotaStatus.details.job.outputError?.includes("10485760-byte"), "default quota overflow was not reported");
+	await removeJob(defaultQuotaJob);
+
+	const boundaryJob = `quota-boundary-${process.pid}`;
+	startedJobs.add(boundaryJob);
+	const boundaryStart = await requiredTool("pwsh-start-job").execute(
+		"quota-boundary-start",
+		{ name: boundaryJob, command: "[Console]::Out.Write('abc雪')", maxLogBytes: 6 },
+		undefined, undefined, ctx,
+	);
+	await waitForJob(boundaryJob, "exited");
+	assert((await readFile(boundaryStart.details.mergedPath)).equals(Buffer.from("abc雪")), "an exact six-byte quota boundary failed");
+	const boundaryDetails = await requiredTool("pwsh-get-job").execute("quota-boundary-details", { name: boundaryJob });
+	assert(!boundaryDetails.details.job.outputError, "an exact quota boundary incorrectly reported overflow");
+	await removeJob(boundaryJob);
+
+	const unicodeOverflowJob = `quota-unicode-${process.pid}`;
+	startedJobs.add(unicodeOverflowJob);
+	const unicodeOverflowStart = await requiredTool("pwsh-start-job").execute(
+		"quota-unicode-start",
+		{ name: unicodeOverflowJob, command: "[Console]::Out.Write('abc雪🚀')", maxLogBytes: 8 },
+		undefined, undefined, ctx,
+	);
+	const unicodeOverflowStatus = await waitForJob(unicodeOverflowJob, "exited");
+	const unicodeOverflowLog = await readFile(unicodeOverflowStart.details.mergedPath);
+	assert(unicodeOverflowLog.equals(Buffer.from("abc雪")), "quota overflow wrote a partial UTF-8 emoji or the wrong prefix");
+	const unicodeOverflowDetails = await requiredTool("pwsh-get-job").execute("quota-unicode-details", { name: unicodeOverflowJob });
+	const unicodeOverflowOutput = await requiredTool("pwsh-get-job-output").execute("quota-unicode-output", { name: unicodeOverflowJob });
+	assert(unicodeOverflowDetails.details.job.outputError && unicodeOverflowOutput.details.outputError, "quota error was not exposed by both job detail tools");
+	assert(unicodeOverflowStatus.includes("Output capture error:"), "quota failure was not persistent in job status");
+	assert(statusUpdates.some(({ key, text }) => key === "powershell-jobs" && text?.includes("failed")), "output failure with exit code 0 did not set failed UI status");
+	assert(sentMessages.filter(({ message }) => message.details?.name === unicodeOverflowJob).length === 1, "quota failure was not emitted exactly once");
+	const zeroExitOverflowDetails = {
+		...unicodeOverflowDetails,
+		details: { ...unicodeOverflowDetails.details, job: { ...unicodeOverflowDetails.details.job, exitCode: 0 } },
+	};
+	const quotaRenderText = requiredTool("pwsh-get-job")
+		.renderResult(zeroExitOverflowDetails, { isPartial: false }, testTheme, createRenderContext({ name: unicodeOverflowJob }))
+		.render(100).join("\n");
+	assert(quotaRenderText.includes("failed"), "get-job rendered an output-capture failure with exit code 0 as successful");
+	await removeJob(unicodeOverflowJob);
+	assert(!existsSync(unicodeOverflowStart.details.mergedPath), "removing a quota-failed job preserved its owned log");
+
+	const separateQuotaJob = `quota-separate-${process.pid}`;
+	startedJobs.add(separateQuotaJob);
+	const separateQuotaStart = await requiredTool("pwsh-start-job").execute(
+		"quota-separate-start",
+		{ name: separateQuotaJob, command: "[Console]::Out.Write('abc'); Start-Sleep -Milliseconds 200; [Console]::Error.Write('雪🚀'); Start-Sleep -Seconds 30", stdout: "default", stderr: "default", maxLogBytes: 8 },
+		undefined, undefined, ctx,
+	);
+	await waitForOutput(separateQuotaJob, "abc");
+	await waitForJob(separateQuotaJob, "exited");
+	assert((await readFile(separateQuotaStart.details.stdoutPath)).equals(Buffer.from("abc")), "combined quota corrupted separate stdout");
+	assert((await readFile(separateQuotaStart.details.stderrPath)).equals(Buffer.from("雪")), "combined quota did not stop at a whole UTF-8 stderr prefix");
+	assert((await stat(separateQuotaStart.details.stdoutPath)).size + (await stat(separateQuotaStart.details.stderrPath)).size === 6, "separate logs did not share one capture budget");
+	await removeJob(separateQuotaJob);
+
+	const discardQuotaJob = `quota-discard-${process.pid}`;
+	startedJobs.add(discardQuotaJob);
+	const discardStart = await requiredTool("pwsh-start-job").execute(
+		"quota-discard-start",
+		{ name: discardQuotaJob, command: "[Console]::Out.Write(('x' * 100000)); [Console]::Error.Write('雪')", stdout: "null", stderr: "default", maxLogBytes: 3 },
+		undefined, undefined, ctx,
+	);
+	const discardStatus = await waitForJob(discardQuotaJob, "exited");
+	assert(discardStatus.includes("Exit code: 0") && !(await requiredTool("pwsh-get-job").execute("quota-discard-details", { name: discardQuotaJob })).details.job.outputError, "discarded output consumed quota");
+	assert((await readFile(discardStart.details.stderrPath)).equals(Buffer.from("雪")), "captured stream failed after large discarded output");
+	await removeJob(discardQuotaJob);
+
+	const callerQuotaJob = `quota-caller-${process.pid}`;
+	const callerQuotaOut = join(scratchDir, "caller-quota-out.log");
+	const callerQuotaErr = join(scratchDir, "caller-quota-err.log");
+	startedJobs.add(callerQuotaJob);
+	await requiredTool("pwsh-start-job").execute("quota-caller-start", {
+		name: callerQuotaJob, command: "[Console]::Out.Write('abc'); [Console]::Error.Write('雪🚀'); Start-Sleep -Seconds 30",
+		stdout: callerQuotaOut, stderr: callerQuotaErr, maxLogBytes: 8,
+	}, undefined, undefined, ctx);
+	await waitForJob(callerQuotaJob, "exited");
+	assert((await stat(callerQuotaOut)).size + (await stat(callerQuotaErr)).size <= 8, "caller-owned files did not share the quota");
+	await removeJob(callerQuotaJob);
+	assert(existsSync(callerQuotaOut) && existsSync(callerQuotaErr), "removing an overflowed job deleted caller-owned logs");
+
+	for (const [suffix, maxLogBytes] of [["zero", 0], ["fraction", 1.5], ["huge", 1024 * 1024 * 1024 + 1]]) {
+		let quotaValidationError = "";
+		try {
+			await requiredTool("pwsh-start-job").execute(`quota-invalid-${suffix}`, {
+				name: `quota-invalid-${suffix}-${process.pid}`, command: "Write-Output unreachable", maxLogBytes,
+			}, undefined, undefined, ctx);
+		} catch (error) {
+			quotaValidationError = String(error);
+		}
+		assert(quotaValidationError.includes("integer from 1 through 1073741824"), `invalid maxLogBytes ${maxLogBytes} was accepted`);
+	}
+
+	const nativeQuotaJob = `quota-native-${process.pid}`;
+	startedJobs.add(nativeQuotaJob);
+	const nativeQuotaStart = await requiredTool("pwsh-start-job").execute("quota-native-start", {
+		name: nativeQuotaJob,
+		command: `& '${quotedNode}' -e 'console.log("quota-child="+process.pid);console.log("quota-ready");setTimeout(()=>process.stdout.write("x".repeat(100000)),500);setInterval(()=>{},1000)'`,
+		maxLogBytes: 64,
+	}, undefined, undefined, ctx);
+	const nativeQuotaReady = await waitForOutputMatch(nativeQuotaJob, /quota-child=(\d+)[\s\S]*quota-ready/);
+	const nativeQuotaPid = Number(nativeQuotaReady.match(/quota-child=(\d+)/)?.[1]);
+	assert(Number.isInteger(nativeQuotaPid), "could not capture quota-overflow native child pid before overflow");
+	await waitForJob(nativeQuotaJob, "exited");
+	await waitForProcessExit(nativeQuotaPid);
+	assert((await stat(nativeQuotaStart.details.mergedPath)).size <= 64, "native-child overflow exceeded its log quota");
+	const nativeFailureMessages = sentMessages.filter(({ message }) => message.details?.name === nativeQuotaJob);
+	assert(nativeFailureMessages.length === 1 && nativeFailureMessages[0].message.details.outputError?.includes("64-byte"), "native-child quota failure was not durably emitted once with its reason");
+	await removeJob(nativeQuotaJob);
+
 	if (process.platform !== "win32" && existsSync("/dev/full")) {
 		const writeFailureJob = `write-failure-${process.pid}`;
 		startedJobs.add(writeFailureJob);
@@ -744,7 +1129,7 @@ Write-Output $value`,
 			"write-failure-start",
 			{
 				name: writeFailureJob,
-				command: "[Console]::Out.Write(('x' * 1000000))",
+				command: "[Console]::Out.Write(('x' * 1000000)); Start-Sleep -Seconds 30",
 				stdout: "/dev/full",
 				stderr: "null",
 			},
@@ -754,6 +1139,13 @@ Write-Output $value`,
 		);
 		const writeFailureStatus = await waitForJob(writeFailureJob, "exited");
 		assert(writeFailureStatus.includes("Output capture error:"), "a background write failure was not reported");
+		const writeFailureDetails = await requiredTool("pwsh-get-job").execute("write-failure-details", { name: writeFailureJob });
+		assert(writeFailureDetails.details.job.outputError, "write failure was not retained in job details after automatic stop");
+		const writeFailureRender = requiredTool("pwsh-get-job")
+			.renderResult(writeFailureDetails, { isPartial: false }, testTheme, createRenderContext({ name: writeFailureJob }))
+			.render(100).join("\n");
+		assert(writeFailureRender.includes("failed"), "write-failed job renderer did not show failed status");
+		assert(sentMessages.filter(({ message }) => message.details?.name === writeFailureJob).length === 1, "write failure was not durably emitted exactly once");
 		await removeJob(writeFailureJob);
 	}
 
@@ -864,16 +1256,15 @@ Write-Output $value`,
 	let cursorChunks = 0;
 	for (; cursorChunks < 20; cursorChunks++) {
 		const chunk = await requiredTool("pwsh-get-job-output").execute("large-job-cursor", { name: largeJob, cursor });
-		incrementalOutput += chunk.content[0].text;
+		incrementalOutput += chunk.details.outputs[0].content;
 		const nextCursor = chunk.details.nextCursor;
 		assert(nextCursor.merged > (cursor.merged ?? -1), "incremental output cursor did not advance");
 		cursor = nextCursor;
 		if (!chunk.details.hasMore.merged) break;
 	}
 	assert(cursorChunks < 20, "incremental output did not reach the end of the log");
-	assert(incrementalOutput.includes("background-line-1"), "incremental output missed the beginning of the log");
-	assert(incrementalOutput.includes("tail-🚀"), "incremental output missed the UTF-8 tail of the log");
-	assert(!incrementalOutput.includes("�"), "incremental output split a UTF-8 character");
+	const expectedIncrementalOutput = Array.from({ length: 20_000 }, (_, index) => `background-line-${index + 1}-雪`).join("\n") + "\ntail-🚀\n";
+	assert(incrementalOutput.replaceAll("\r\n", "\n") === expectedIncrementalOutput, "cursor reads lost, duplicated, or corrupted output");
 	await removeJob(largeJob);
 
 	const shutdownJob = `shutdown-${process.pid}`;
@@ -948,19 +1339,26 @@ Write-Output $value`,
 				nonzeroExit: "passed",
 				timeoutMs,
 				abort: "passed",
+				missingTaskkillCancellation: process.platform === "win32" ? "passed" : "Windows-only",
 				foregroundDescendantCleanup: "passed",
 				truncation: "passed",
 				backgroundComplete: "passed",
 				backgroundNonzeroExit: "passed",
+				rootCrashFailureOnce: "passed",
 				backgroundWorkingDirectory: "passed",
 				backgroundStartValidation: "passed",
 				duplicateStart: "passed",
 				backgroundStop: "passed",
+				concurrentRemovalRestart: "passed",
+				staleUiRemoval: "passed",
 				directChildStop: "passed",
+				sigtermEscalation: process.platform === "win32" ? "Unix-only" : "passed",
 				descendantStop: process.platform === "win32" ? "not run on Windows" : "passed",
 				backgroundEnvironment: "passed",
 				backgroundEnvironmentOverride: "passed",
 				partialLogOpenCleanup: "passed",
+				ownedLogCollision: "passed",
+				caseVariantOwnedLogs: process.platform === "win32" ? "passed" : "Windows-only",
 				failedLogWriteDrain:
 					process.platform === "win32" || !existsSync("/dev/full") ? "not supported" : "passed",
 				separateStreams: "passed",
@@ -970,6 +1368,9 @@ Write-Output $value`,
 				fullLogPathOptIn: "passed",
 				privateOwnedLogs: process.platform === "win32" ? "not applicable" : "passed",
 				customLogPreserved: "passed",
+				combinedJobLogQuota: "passed",
+				quotaUtf8Boundaries: "passed",
+				quotaAutomaticTreeStop: "passed",
 				sessionShutdownRace: "passed",
 				jobDirectoryCleanup: "passed",
 				sessionRestart: "passed",
@@ -1072,7 +1473,8 @@ async function waitForJob(name, expectedStatus) {
 async function waitForOutput(name, expectedText) {
 	for (let attempt = 0; attempt < 40; attempt++) {
 		const result = await requiredTool("pwsh-get-job-output").execute("poll-output", { name });
-		if (result.content[0].text.includes(expectedText)) return result.content[0].text;
+		const output = result.details.outputs.map((section) => section.content).join("\n");
+		if (output.includes(expectedText)) return output;
 		await new Promise((resolveWait) => setTimeout(resolveWait, 250));
 	}
 	throw new Error(`Timed out waiting for '${expectedText}' from job '${name}'`);
@@ -1081,7 +1483,8 @@ async function waitForOutput(name, expectedText) {
 async function waitForOutputMatch(name, expectedPattern) {
 	for (let attempt = 0; attempt < 40; attempt++) {
 		const result = await requiredTool("pwsh-get-job-output").execute("poll-output", { name });
-		if (expectedPattern.test(result.content[0].text)) return result.content[0].text;
+		const output = result.details.outputs.map((section) => section.content).join("\n");
+		if (expectedPattern.test(output)) return output;
 		await new Promise((resolveWait) => setTimeout(resolveWait, 250));
 	}
 	throw new Error(`Timed out waiting for ${expectedPattern} from job '${name}'`);

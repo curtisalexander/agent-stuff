@@ -1,8 +1,8 @@
 // Job tool API shape (pwsh-start-job / get / stop / remove / get-output, the
 // "null" discard sentinel, merged-by-default logging, and UTF-8 prefix) is
 // adapted from @marcfargas/pi-powershell (MIT). Implementation is
-// Node-native (child_process.spawn with detached + fd redirection) rather than
-// PowerShell's Start-Process.
+// Foreground execution is Node-native. Background jobs require an OS-contained
+// guardian rather than PowerShell's Start-Process or process-group-only cleanup.
 //   https://github.com/marcfargas/pi-powershell
 import {
 	createPowerShellToolDefinition,
@@ -19,10 +19,12 @@ import {
 import { Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { access, chmod, mkdir, open, rm, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import type { Readable } from "node:stream";
+import { spawnSupervisedJob, type SupervisedJob } from "./powershell/supervisor.js";
 
 const DEFAULT_SHELL = process.env.POWERSHELL_BIN || "pwsh";
 const IS_WINDOWS = process.platform === "win32";
@@ -33,6 +35,7 @@ const POWERSHELL_PROBE_TIMEOUT_MS = 5_000;
 const JOB_STATUS_KEY = "powershell-jobs";
 const JOB_FAILURE_MESSAGE_TYPE = "powershell-job-failed";
 const JOB_OUTPUT_PREVIEW_LINES = 5;
+const DEFAULT_JOB_LOG_BYTES = 10 * 1024 * 1024;
 
 const UTF8_PREFIX =
 	"[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); " +
@@ -126,6 +129,7 @@ function forwardUtf8Stream(stream: Readable, onData: (data: Buffer) => void): Pr
 interface JobLogSink {
 	file: FileHandle;
 	pendingWrite: Promise<void>;
+	budget: { limit: number; written: number; error?: Error };
 }
 
 async function writeAll(file: FileHandle, data: Buffer): Promise<void> {
@@ -138,7 +142,22 @@ async function writeAll(file: FileHandle, data: Buffer): Promise<void> {
 }
 
 function writeJobLog(sink: JobLogSink, data: Buffer): Promise<void> {
-	const write = sink.pendingWrite.then(() => writeAll(sink.file, data));
+	const write = sink.pendingWrite.then(async () => {
+		const budget = sink.budget;
+		if (budget.error) throw budget.error;
+		const remaining = budget.limit - budget.written;
+		const exceeded = data.length > remaining;
+		const prefix = exceeded ? data.subarray(0, completeUtf8PrefixLength(data.subarray(0, remaining))) : data;
+		// Reserve synchronously before the write: separate streams share a budget.
+		budget.written += prefix.length;
+		if (exceeded) budget.error = new Error(`Captured output exceeded the ${budget.limit}-byte job log limit. Increase maxLogBytes or discard noisy streams.`);
+		try {
+			await writeAll(sink.file, prefix);
+		} catch (error) {
+			budget.error ??= error instanceof Error ? error : new Error(String(error));
+		}
+		if (budget.error) throw budget.error;
+	});
 	sink.pendingWrite = write;
 	return write;
 }
@@ -275,16 +294,29 @@ async function taskkill(pid: number, force: boolean): Promise<number> {
 		if (force) args.push("/F");
 		const taskkillPath = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe");
 		const killer = spawn(taskkillPath, args, { stdio: "ignore", windowsHide: true });
-		killer.once("error", () => resolveKill(-1));
-		killer.once("close", (code) => resolveKill(code ?? -1));
+		const timer = setTimeout(() => {
+			killer.kill();
+			resolveKill(-1);
+		}, 5_000);
+		const finish = (code: number) => {
+			clearTimeout(timer);
+			resolveKill(code);
+		};
+		killer.once("error", () => finish(-1));
+		killer.once("close", (code) => finish(code ?? -1));
 	});
 }
 
 async function terminateProcessTree(child: ChildProcess): Promise<boolean> {
 	if (!child.pid) return childHasExited(child);
 	if (IS_WINDOWS) {
+		if (childHasExited(child)) return true;
 		const exitCode = await taskkill(child.pid, true);
-		return exitCode === 0 || childHasExited(child);
+		if (exitCode === 0) return true;
+		// Missing/failed taskkill must not leave a foreground call hanging.
+		// Killing the root is only a fallback, not proof of descendant cleanup.
+		if (!childHasExited(child)) child.kill("SIGKILL");
+		return false;
 	}
 	if (!processGroupExists(child.pid)) return true;
 	signalProcessGroup(child.pid, "SIGTERM");
@@ -397,7 +429,18 @@ const powershellOperations: PowerShellOperations = {
 		let timedOut = false;
 		let timeoutId: NodeJS.Timeout | undefined;
 		let termination: Promise<boolean> | undefined;
-		const terminate = () => (termination ??= terminateProcessTree(child));
+		const cleanupError = new Error(`Could not stop the PowerShell process tree (pid ${child.pid}). Check for surviving processes.`);
+		let rejectTermination!: (error: unknown) => void;
+		const terminationFailed = new Promise<never>((_resolve, reject) => {
+			rejectTermination = reject;
+		});
+		const terminate = () => (termination ??= terminateProcessTree(child).then((stopped) => {
+			if (!stopped) rejectTermination(cleanupError);
+			return stopped;
+		}, (error) => {
+			rejectTermination(error);
+			return false;
+		}));
 		const onAbort = () => void terminate();
 		try {
 			if (timeoutMs !== undefined) {
@@ -410,9 +453,9 @@ const powershellOperations: PowerShellOperations = {
 				if (signal.aborted) onAbort();
 				else signal.addEventListener("abort", onAbort, { once: true });
 			}
-			const exitCode = await waitForChildProcess(child);
+			const exitCode = await Promise.race([waitForChildProcess(child), terminationFailed]);
 			await outputDone;
-			if (termination) await termination;
+			if (termination && !(await termination)) throw cleanupError;
 			if (signal?.aborted) throw new Error("aborted");
 			if (timedOut) throw new Error(`timeout:${timeout}`);
 			if (outputError) throw outputError;
@@ -420,6 +463,10 @@ const powershellOperations: PowerShellOperations = {
 		} finally {
 			if (timeoutId) clearTimeout(timeoutId);
 			if (signal) signal.removeEventListener("abort", onAbort);
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			await outputDone;
+			child.unref();
 		}
 	},
 };
@@ -429,6 +476,7 @@ interface JobSummary {
 	status: "running" | "exited";
 	pid: number;
 	exitCode: number | null;
+	outputError?: string;
 	startedAt: number;
 	endedAt: number | null;
 	command: string;
@@ -455,6 +503,7 @@ interface JobOutputDetails {
 	name: string;
 	status: "running" | "exited";
 	exitCode: number | null;
+	outputError?: string;
 	startedAt: number;
 	endedAt: number | null;
 	mergedPath?: string | null;
@@ -470,6 +519,7 @@ interface JobFailureDetails {
 	pid: number;
 	exitCode: number;
 	endedAt: number;
+	outputError?: string;
 }
 
 interface JobRecord {
@@ -486,11 +536,13 @@ interface JobRecord {
 	ownedLogPaths: string[];
 	status: "running" | "exited";
 	child: ChildProcess;
+	supervisor: SupervisedJob;
 	outputDone: Promise<void>;
 	outputError: Error | null;
-	trackingStopped: boolean;
 	stopRequested: boolean;
 	completionReported: boolean;
+	stopping?: Promise<void>;
+	removing?: Promise<void>;
 }
 
 const jobs = new Map<string, JobRecord>();
@@ -642,22 +694,6 @@ function markJobExited(job: JobRecord, code: number | null = job.child.exitCode)
 	job.endedAt ??= Date.now();
 }
 
-async function trackProcessGroupExit(job: JobRecord, code: number | null) {
-	if (IS_WINDOWS || !processGroupExists(job.pid)) {
-		await job.outputDone;
-		markJobExited(job, code);
-		return;
-	}
-	job.exitCode = code ?? -1;
-	while (!job.trackingStopped && job.status === "running" && processGroupExists(job.pid)) {
-		await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-	}
-	if (!job.trackingStopped && job.status === "running") {
-		await job.outputDone;
-		markJobExited(job, code);
-	}
-}
-
 async function finishTerminatedOutput(child: ChildProcess, outputDone: Promise<void>) {
 	let timer: NodeJS.Timeout | undefined;
 	const completed = await Promise.race([
@@ -673,17 +709,33 @@ async function finishTerminatedOutput(child: ChildProcess, outputDone: Promise<v
 	await outputDone;
 }
 
-async function stopJob(job: JobRecord) {
-	if (job.status === "exited") {
-		await job.outputDone;
-		return;
-	}
-	job.stopRequested = true;
-	if (!(await terminateProcessTree(job.child))) {
-		throw new Error(`Could not stop the process tree for job '${job.name}' (pid ${job.pid}).`);
-	}
-	await finishTerminatedOutput(job.child, job.outputDone);
-	markJobExited(job);
+function stopJob(job: JobRecord, automatic = false): Promise<void> {
+	// Tools, the interactive manager, and shutdown can all stop the same job.
+	if (!automatic) job.stopRequested = true;
+	return (job.stopping ??= (async () => {
+		if (job.status === "exited") {
+			await job.outputDone;
+			return;
+		}
+		await job.supervisor.stop();
+		await finishTerminatedOutput(job.child, job.outputDone);
+		markJobExited(job, await job.supervisor.exited);
+	})().catch((error) => {
+		job.stopping = undefined;
+		throw error;
+	}));
+}
+
+function removeJob(job: JobRecord): Promise<void> {
+	return (job.removing ??= (async () => {
+		await stopJob(job);
+		await removeJobFiles(job);
+		// A UI confirmation can outlive the original job and its name.
+		if (jobs.get(job.name) === job) jobs.delete(job.name);
+	})().catch((error) => {
+		job.removing = undefined;
+		throw error;
+	}));
 }
 
 function toJobSummary(job: JobRecord): JobSummary {
@@ -692,6 +744,7 @@ function toJobSummary(job: JobRecord): JobSummary {
 		status: job.status,
 		pid: job.pid,
 		exitCode: job.exitCode,
+		outputError: job.outputError?.message,
 		startedAt: job.startedAt,
 		endedAt: job.endedAt,
 		command: job.command,
@@ -767,6 +820,7 @@ async function getJobOutputResult(job: JobRecord, params: JobOutputParams) {
 		name: job.name,
 		status: job.status,
 		exitCode: job.exitCode,
+		outputError: job.outputError?.message,
 		startedAt: job.startedAt,
 		endedAt: job.endedAt,
 		mergedPath: params.full === true ? job.mergedPath : undefined,
@@ -788,7 +842,7 @@ function updateJobStatus(ctx: ExtensionContext | undefined): void {
 	}
 	const running = tracked.filter((job) => job.status === "running").length;
 	const failed = tracked.filter(
-		(job) => job.status === "exited" && !job.stopRequested && job.exitCode !== null && job.exitCode !== 0,
+		(job) => job.status === "exited" && (!!job.outputError || (!job.stopRequested && job.exitCode !== null && job.exitCode !== 0)),
 	).length;
 	const done = tracked.length - running - failed;
 	const parts = [running > 0 ? `${running} running` : undefined, failed > 0 ? `${failed} failed` : undefined, done > 0 ? `${done} done` : undefined];
@@ -878,7 +932,8 @@ function renderCallTitle(context: JobToolRenderContext, theme: Theme, title: str
 	return reuseText(context, theme.fg("toolTitle", theme.bold(title)) + suffix);
 }
 
-function styleJobState(theme: Theme, job: Pick<JobSummary, "status" | "exitCode">): string {
+function styleJobState(theme: Theme, job: Pick<JobSummary, "status" | "exitCode" | "outputError">): string {
+	if (job.outputError) return theme.fg("error", "failed (output capture)");
 	if (job.status === "running") return theme.fg("accent", "running");
 	if (job.exitCode === 0) return theme.fg("success", "done");
 	return theme.fg("error", `failed (${job.exitCode ?? "?"})`);
@@ -971,9 +1026,10 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		job.completionReported = true;
 		updateJobStatus(ctx);
 		if (shuttingDown || job.stopRequested) return;
-		const failed = job.exitCode !== 0;
+		const failed = job.exitCode !== 0 || !!job.outputError;
+		const reason = job.outputError ? `failed to capture output: ${job.outputError.message}` : `failed with exit code ${job.exitCode ?? "unknown"}`;
 		ctx.ui.notify(
-			`PowerShell job '${job.name}' ${failed ? `failed with exit code ${job.exitCode ?? "unknown"}` : "completed successfully"}.`,
+			`PowerShell job '${job.name}' ${failed ? reason : "completed successfully"}.`,
 			failed ? "error" : "info",
 		);
 		if (failed) {
@@ -982,11 +1038,12 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				pid: job.pid,
 				exitCode: job.exitCode ?? -1,
 				endedAt: job.endedAt ?? Date.now(),
+				outputError: job.outputError?.message,
 			};
 			pi.sendMessage(
 				{
 					customType: JOB_FAILURE_MESSAGE_TYPE,
-					content: `PowerShell job '${job.name}' failed with exit code ${details.exitCode}. Use pwsh-get-job-output to inspect its output.`,
+					content: `PowerShell job '${job.name}' ${reason}. Use pwsh-get-job-output to inspect its output.`,
 					display: true,
 					details,
 				},
@@ -1000,6 +1057,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		if (!details) return new Text(theme.fg("error", String(message.content)), 1, 0);
 		let text = theme.fg("error", theme.bold(`PowerShell job failed: ${details.name}`));
 		text += theme.fg("muted", ` · exit ${details.exitCode}`);
+		if (details.outputError) text += `\n${theme.fg("error", details.outputError)}`;
 		if (expanded) {
 			text += `\n${theme.fg("dim", `pid ${details.pid} · ${new Date(details.endedAt).toLocaleTimeString()}`)}`;
 			text += `\n${theme.fg("dim", `Use pwsh-get-job-output with name=${details.name} to inspect its output.`)}`;
@@ -1061,13 +1119,9 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		await Promise.all(
 			Array.from(jobs.values(), async (job) => {
 				try {
-					await stopJob(job);
-					await removeJobFiles(job);
-					jobs.delete(job.name);
+					await removeJob(job);
 				} catch (error) {
 					errors.push(new Error(`Failed to clean up PowerShell job '${job.name}' during shutdown.`, { cause: error }));
-				} finally {
-					job.trackingStopped = true;
 				}
 			}),
 		);
@@ -1098,21 +1152,18 @@ export default function powershellExtension(pi: ExtensionAPI) {
 			"Use pwsh-start-job (not powershell with a trailing background operator such as `command &`) when you need to run a dev server, test watcher, or any long-running process. pwsh-start-job survives across tool calls; a backgrounded powershell call does not.",
 			"You can inspect PI_* environment variables for current model and session details.",
 		],
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const definition = createPowerShellToolDefinition(ctx.cwd, { operations: powershellOperations });
-			return definition.execute(toolCallId, params, signal, onUpdate, ctx);
-		},
 	});
 
 	pi.registerTool({
 		name: "pwsh-start-job",
 		label: "Start PowerShell Job",
 		description:
-			"Start a background PowerShell process that survives across tool calls in the current Pi session runtime. Use for dev servers, test watchers, or other long-running tasks. Invoke the long-running program directly; do not use Start-Process, Start-Job, or another self-detaching launcher because it can escape tracking on Windows. UTF-8 text output is normalized into a log file (merged by default) and readable via pwsh-get-job-output. Use pwsh-stop-job / pwsh-remove-job to clean up.",
-		promptSnippet: "Start a detached PowerShell background process, tracked by name.",
+			"Start a supervised background PowerShell process in the current Pi session. Requires Linux systemd user services or Windows Job Objects; no unsafe fallback. The entire job ends when its root exits, Pi disconnects, or captured output exceeds maxLogBytes (default 10 MiB). UTF-8 logs are merged by default. Use pwsh-stop-job / pwsh-remove-job to clean up.",
+		promptSnippet: "Start an OS-supervised PowerShell background job, tracked by name.",
 		promptGuidelines: [
 			"Use pwsh-start-job for long-running processes (dev servers, watchers) so they persist across tool calls.",
-			"Invoke the long-running program directly. Do not use Start-Process, Start-Job, a trailing background operator (`command &`), or another self-detaching/backgrounding construct inside the command; on Windows an escaped process cannot be reliably tracked after the root pwsh exits. The `&` call operator remains appropriate for synchronous invocation.",
+			"Invoke the long-running program directly: root PowerShell exit stops all contained descendants, including detached ones. The `&` call operator is appropriate for synchronous invocation. Do not launch work through external brokers such as task schedulers, service managers, or WMI; those are outside the job container.",
+			"The combined captured stdout/stderr budget defaults to 10 MiB. Quota or write failure stops the job and preserves its UTF-8 prefix. Increase maxLogBytes explicitly or discard noisy streams; cursor offsets are never reset by rotation.",
 			"Check status with pwsh-get-job, read output with pwsh-get-job-output, and always clean up with pwsh-remove-job when finished.",
 			"Configure native programs to emit UTF-8 text. Redirect binary data or output in another encoding to an appropriate file instead of the job log.",
 			"Pass `stderr: \"null\"` or `stdout: \"null\"` to pwsh-start-job to discard a stream; pass a file path to redirect it. Omit both for a single merged log.",
@@ -1124,6 +1175,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
 			}),
 			command: Type.String({ description: "The PowerShell command to run in the background" }),
+			maxLogBytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 1024 * 1024 * 1024, description: "Combined captured stdout/stderr byte limit; default 10 MiB. Exceeding it stops the job and preserves the captured prefix." })),
 			workingDirectory: Type.Optional(
 				Type.String({ description: "Optional working directory, relative to the current project" }),
 			),
@@ -1174,14 +1226,21 @@ export default function powershellExtension(pi: ExtensionAPI) {
 			startingJobs.add(params.name);
 			const openLogSinks = new Set<JobLogSink>();
 			let child: ChildProcess | undefined;
+			let supervisor: SupervisedJob | undefined;
 			let record: JobRecord | undefined;
 			let outputDone: Promise<void> | undefined;
 			let pendingOutputError: Error | null = null;
 			let ownedLogPaths: string[] = [];
 			const setOutputError = (error: unknown) => {
+				if (pendingOutputError) return;
 				const normalized = error instanceof Error ? error : new Error(String(error));
-				pendingOutputError ??= normalized;
-				if (record) record.outputError ??= normalized;
+				pendingOutputError = normalized;
+				if (record) {
+					record.outputError = normalized;
+					void stopJob(record, true).then(() => reportJobCompletion(record!, ctx), (cleanupError) => {
+						ctx.ui.notify(`PowerShell output capture and cleanup failed for '${params.name}': ${String(cleanupError)}`, "error");
+					});
+				}
 			};
 			const closeJobLogs = async () => {
 				const sinks = Array.from(openLogSinks);
@@ -1189,6 +1248,9 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				await Promise.all(sinks.map((sink) => closeJobLog(sink).catch(setOutputError)));
 			};
 			try {
+				const limit = params.maxLogBytes ?? DEFAULT_JOB_LOG_BYTES;
+				if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1024 * 1024 * 1024) throw new Error("maxLogBytes must be an integer from 1 through 1073741824.");
+				const budget = { limit, written: 0 };
 				const cwd = resolveWorkingDirectory(ctx.cwd, params.workingDirectory);
 				const jobsDir = await getJobsDir();
 				if (shuttingDown) throw new Error(`Starting job '${params.name}' was interrupted by PowerShell extension shutdown.`);
@@ -1201,9 +1263,11 @@ export default function powershellExtension(pi: ExtensionAPI) {
 					jobEnv[name] = value;
 				}
 				const bothDefault = params.stdout === undefined && params.stderr === undefined;
-				const stdoutSpec = resolveJobStream(jobsDir, cwd, params.name, "stdout", params.stdout, bothDefault);
-				const stderrSpec = resolveJobStream(jobsDir, cwd, params.name, "stderr", params.stderr, bothDefault);
-				const mergedPath = bothDefault ? join(jobsDir, `${params.name}.log`) : null;
+				// Suffix collisions and case variants must never share owned logs.
+				const logName = randomUUID();
+				const stdoutSpec = resolveJobStream(jobsDir, cwd, logName, "stdout", params.stdout, bothDefault);
+				const stderrSpec = resolveJobStream(jobsDir, cwd, logName, "stderr", params.stderr, bothDefault);
+				const mergedPath = bothDefault ? join(jobsDir, `${logName}.log`) : null;
 				let stdoutSink: JobLogSink | null = null;
 				let stderrSink: JobLogSink | null = null;
 				let stdoutPath: string | null = null;
@@ -1214,7 +1278,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 						.every((spec) => spec.owned);
 				const openJobLog = async (path: string, owned: boolean) => {
 					const file = await open(path, "w", owned ? 0o600 : 0o666);
-					const sinkHandle = { file, pendingWrite: Promise.resolve() };
+					const sinkHandle = { file, pendingWrite: Promise.resolve(), budget };
 					openLogSinks.add(sinkHandle);
 					if (owned && !IS_WINDOWS) await file.chmod(0o600);
 					return sinkHandle;
@@ -1250,19 +1314,11 @@ export default function powershellExtension(pi: ExtensionAPI) {
 							: `Starting job '${params.name}' was aborted.`,
 					);
 				}
-				child = spawn(
-					DEFAULT_SHELL,
-					["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", wrapCommand(params.command)],
-					{
-						cwd,
-						env: jobEnv,
-						detached: !IS_WINDOWS,
-						stdio: ["ignore", stdoutSink ? "pipe" : "ignore", stderrSink ? "pipe" : "ignore"],
-						windowsHide: true,
-					},
-				);
+				supervisor = await spawnSupervisedJob({ shell: DEFAULT_SHELL, command: wrapCommand(params.command), cwd, env: jobEnv }, signal);
+				child = supervisor.child;
 				const capture = (stream: Readable | null, sink: JobLogSink | null) => {
-					if (stream === null || sink === null) return Promise.resolve();
+					if (stream === null) return Promise.resolve();
+					if (sink === null) { stream.resume(); return Promise.resolve(); }
 					return captureUtf8Stream(stream, sink, setOutputError).catch(setOutputError);
 				};
 				outputDone = Promise.all([capture(child.stdout, stdoutSink), capture(child.stderr, stderrSink)])
@@ -1283,37 +1339,22 @@ export default function powershellExtension(pi: ExtensionAPI) {
 						ownedLogPaths,
 						status: "running",
 						child,
+						supervisor,
 						outputDone,
 						outputError: pendingOutputError,
-						trackingStopped: false,
 						stopRequested: false,
 						completionReported: false,
 					};
 					jobs.set(params.name, record);
-					child.on("close", (code) =>
-						void trackProcessGroupExit(record!, code).then(() => reportJobCompletion(record!, ctx)),
-					);
-					child.on("error", () =>
-						void record!.outputDone.then(() => {
-							markJobExited(record!);
-							reportJobCompletion(record!, ctx);
-						}),
-					);
+					void supervisor.exited.then(async (code) => {
+						await record!.outputDone;
+						markJobExited(record!, code);
+						reportJobCompletion(record!, ctx);
+					});
 				}
-				await new Promise<void>((resolveSpawn, rejectSpawn) => {
-					const onSpawn = () => {
-						child!.removeListener("error", onError);
-						resolveSpawn();
-					};
-					const onError = (error: Error) => {
-						child!.removeListener("spawn", onSpawn);
-						rejectSpawn(error);
-					};
-					child!.once("spawn", onSpawn);
-					child!.once("error", onError);
-				});
-				if (!child.pid) throw new Error(`Failed to spawn background process for job '${params.name}'.`);
+				const pid = await supervisor.started;
 				if (!record) throw new Error(`Failed to track background process for job '${params.name}'.`);
+				record.pid = pid;
 				if (shuttingDown || signal?.aborted) {
 					await stopJob(record);
 					throw new Error(
@@ -1327,10 +1368,10 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				updateJobStatus(ctx);
 
 				return {
-					content: [{ type: "text", text: `Started job '${params.name}' (pid ${child.pid}).\n\n${summarizeJob(record)}` }],
+					content: [{ type: "text", text: `Started job '${params.name}' (pid ${record.pid}).\n\n${summarizeJob(record)}` }],
 					details: {
 						name: params.name,
-						pid: child.pid,
+						pid: record.pid,
 						cwd,
 						startedAt: record.startedAt,
 						status: record.status,
@@ -1343,16 +1384,10 @@ export default function powershellExtension(pi: ExtensionAPI) {
 			} catch (error) {
 				try {
 					if (record) {
-						if (record.status === "running") await stopJob(record);
-						else await record.outputDone;
-						record.trackingStopped = true;
-						await removeJobFiles(record);
-						jobs.delete(record.name);
+						await removeJob(record);
 						updateJobStatus(ctx);
 					} else {
-						if (child?.pid && !childHasExited(child) && !(await terminateProcessTree(child))) {
-							throw new Error(`Could not stop the untracked process for job '${params.name}'.`);
-						}
+						await supervisor?.stop();
 						if (child && outputDone) {
 							await finishTerminatedOutput(child, outputDone);
 						} else {
@@ -1419,7 +1454,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		name: "pwsh-stop-job",
 		label: "Stop PowerShell Job",
 		description:
-			"Stop a background PowerShell process tree. Uses taskkill /T /F on Windows while the root pwsh is alive; self-detached Windows descendants may escape tracking. On macOS and Linux it sends SIGTERM, then SIGKILL after 3 seconds if the process group is still alive.",
+			"Stop the whole supervised PowerShell job, including detached descendants. Linux systemd sends SIGTERM then SIGKILL after 3 seconds; Windows closes the guardian's kill-on-close Job Object. Cleanup completes even if the stop tool call is cancelled.",
 		promptSnippet: "Stop a running pwsh background job.",
 		parameters: Type.Object({
 			name: Type.String({ description: "Job name to stop" }),
@@ -1473,10 +1508,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const job = jobs.get(params.name);
 			if (!job) throw new Error(`No job named '${params.name}'.`);
-			if (job.status === "running") await stopJob(job);
-			await removeJobFiles(job);
-			job.trackingStopped = true;
-			jobs.delete(params.name);
+			await removeJob(job);
 			updateJobStatus(ctx);
 			return {
 				content: [{ type: "text", text: `Removed job '${params.name}' (exit code ${job.exitCode ?? "-"}).` }],
@@ -1543,7 +1575,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 				}
 				const choices = new Map(
 					tracked.map((job) => [
-						`${job.name} · ${job.status === "running" ? "running" : job.exitCode === 0 ? "done" : `failed (${job.exitCode ?? "?"})`} · pid ${job.pid} · ${formatJobAge(job)}`,
+						`${job.name} · ${job.outputError ? "failed (output capture)" : job.status === "running" ? "running" : job.exitCode === 0 ? "done" : `failed (${job.exitCode ?? "?"})`} · pid ${job.pid} · ${formatJobAge(job)}`,
 						job.name,
 					]),
 				);
@@ -1590,10 +1622,7 @@ export default function powershellExtension(pi: ExtensionAPI) {
 						))
 					)
 						continue;
-					if (job.status === "running") await stopJob(job);
-					await removeJobFiles(job);
-					job.trackingStopped = true;
-					jobs.delete(job.name);
+					await removeJob(job);
 					updateJobStatus(ctx);
 					ctx.ui.notify(`Removed PowerShell job '${job.name}'.`, "info");
 				}

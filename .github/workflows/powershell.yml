@@ -5,6 +5,9 @@ on:
     paths:
       - ".github/workflows/powershell.yml"
       - "extensions/powershell.ts"
+      - "extensions/powershell/**"
+      - "scripts/powershell-job-*"
+      - "scripts/test-powershell-supervisor.mjs"
       - "scripts/install-powershell-linux.sh"
       - "scripts/test-powershell-extension.mjs"
       - "package.json"
@@ -14,6 +17,9 @@ on:
     paths:
       - ".github/workflows/powershell.yml"
       - "extensions/powershell.ts"
+      - "extensions/powershell/**"
+      - "scripts/powershell-job-*"
+      - "scripts/test-powershell-supervisor.mjs"
       - "scripts/install-powershell-linux.sh"
       - "scripts/test-powershell-extension.mjs"
       - "package.json"
@@ -42,5 +48,13 @@ jobs:
         run: |
           npm run setup:powershell
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Start systemd user manager for native containment tests
+        if: runner.os == 'Linux'
+        run: |
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user show-environment >/dev/null
       - run: npm run check
+      - name: Native containment release gate
+        run: npm run test:powershell:supervisor
       - run: npm run test:powershell
