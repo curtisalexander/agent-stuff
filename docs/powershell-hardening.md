@@ -16,7 +16,7 @@ The follow-up explicitly approved native supervision as a prerequisite, with no 
 
 `npm run check`, `npm run test:powershell:supervisor`, and `npm run test:powershell` pass on Linux with PowerShell 7.6.4, Node 22.19, and Pi 0.85.1. In this orb tests use `XDG_RUNTIME_DIR=/run/user/1000` after starting `user@1000.service`. Native crash tests hard-kill the owner and guardian, observe exact workload/detached-descendant PIDs disappear, and verify an unrelated process survives. They also cover failed startup and early versus late cancellation. Integration tests cover merged/separate quotas, exact and split-Unicode boundaries, discarded streams, caller-owned logs, automatic descendant cleanup, and `/dev/full` failures.
 
-Windows PowerShell parsing, embedded C# compilation, and configuration deserialization were checked under Linux PowerShell. **Those checks do not verify Windows Job Objects.** The Ubuntu/Windows workflow now runs the supervisor suite as a required step alongside integration tests. Native Windows must pass before release; this thread has not pushed or triggered that run. The model-driven test was attempted but could not run because the orb has no configured model API key/OAuth login.
+The [native Ubuntu/Windows PR run](https://github.com/curtisalexander/agent-stuff/actions/runs/34401504220) passed type checking, supervisor tests, and integration tests on both platforms on 2026-09-09. Windows ran PowerShell 7.6.5 and verified actual Job Object cleanup, not merely guardian compilation. The initial Windows run exposed a path-string assertion that did not account for alternate Windows path spellings; working-directory tests now compare filesystem-resolved paths and inspect captured output. The model-driven test was attempted but could not run because the orb has no configured model API key/OAuth login.
 
 ### Remaining boundaries, not silent fallback guarantees
 
@@ -50,7 +50,7 @@ The npm registry's `latest` tag was **0.85.1**, matching the September 5 release
 
 The Linux suite uses real PowerShell 7.6.4 and Pi 0.85.1. It covers the findings above, concurrent stop/removes followed by same-name restart, a stale confirmation that creates a replacement before resolving, abrupt PowerShell self-termination with exactly one durable failure message, and a native child that ignores SIGTERM and requires SIGKILL. Existing tests cover shutdown during startup, partial log-open/write failures, descendant termination, Unicode boundaries, and cleanup across session restart. Type checking includes all repository extensions after the shared dependency update.
 
-Native Windows execution is still required for the new missing-`taskkill` and case-insensitive-path regressions, alongside the existing Windows activation and process-tree tests. The existing Ubuntu/Windows CI matrix includes them; this review did not trigger CI or claim a native Windows run. The model-driven suite is separate from these deterministic checks.
+Native Windows CI passed the missing-`taskkill` and case-insensitive-path regressions, alongside the Windows activation, fallback, and process-tree tests. The model-driven suite is separate from these deterministic checks and remains unverified.
 
 The initial review deferred native supervision and log policy. The approved follow-up above supersedes that decision for background jobs; global exception handlers and persistent PID recovery remain deliberately excluded.
 
@@ -93,16 +93,16 @@ The initial review deferred native supervision and log policy. The approved foll
 - [x] Bound the supported Pi and TypeBox versions to tested compatibility ranges.
 - [x] Correct and expand the user documentation.
 
-## Requires a native Windows environment
+## Native Windows verification completed
 
 - [x] Add a Windows CI workflow and a cross-platform direct-child process-tree test.
-- [ ] Verify automatic tool activation when PowerShell 7 is present.
-- [ ] Verify `bash` remains active when PowerShell 7 is absent.
-- [ ] Verify foreground timeout and cancellation kill Windows descendants.
+- [x] Verify automatic tool activation when PowerShell 7 is present.
+- [x] Verify `bash` remains active when PowerShell 7 is absent.
+- [x] Verify foreground timeout and cancellation kill Windows descendants.
 - [x] Verify `taskkill /T /F` stops directly launched long-running workloads.
-- [ ] Verify Job Object cleanup after owner/guardian death and for detached native descendants.
-- [ ] Run the split-stream/BOM regression cases on the native Windows CI runner.
+- [x] Verify Job Object cleanup after owner/guardian death and for detached native descendants.
+- [x] Run the split-stream/BOM regression cases on the native Windows CI runner.
 
-Deterministic checks for activation, fallback, and foreground descendant cleanup are included in `test:powershell`; the remaining boxes should be checked after the updated suite completes on the native Windows runner.
+Deterministic checks for activation, fallback, and foreground descendant cleanup passed in `test:powershell`; owner/guardian crash containment passed in `test:powershell:supervisor`.
 
-Windows Job Object supervision is implemented; the native test gate above must pass before release.
+The native test gate has passed for this implementation. Future executable changes must continue to pass both platform suites before release.
