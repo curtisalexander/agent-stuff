@@ -2,7 +2,7 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -441,7 +441,8 @@ Write-Output $value`,
 		undefined,
 		{ ...ctx, cwd: unicodeCwd },
 	);
-	assert(foregroundCwd.content[0].text.trim() === unicodeCwd, "Pi's tool definition ignored runtime ctx.cwd");
+	const reportedCwd = foregroundCwd.content[0].text.trim();
+	assert(await realpath(reportedCwd) === await realpath(unicodeCwd), `Pi's tool definition ignored runtime ctx.cwd: expected ${unicodeCwd}, received ${reportedCwd}`);
 	const cwdJob = `cwd-${process.pid}`;
 	startedJobs.add(cwdJob);
 	await requiredTool("pwsh-start-job").execute(
@@ -453,7 +454,8 @@ Write-Output $value`,
 	);
 	await waitForJob(cwdJob, "exited");
 	const cwdOutput = await requiredTool("pwsh-get-job-output").execute("cwd-output", { name: cwdJob });
-	assert(cwdOutput.content[0].text.includes(unicodeCwd), "background Unicode working directory was not preserved");
+	const reportedJobCwd = cwdOutput.details.outputs[0].content.trim();
+	assert(await realpath(reportedJobCwd) === await realpath(unicodeCwd), `Background Unicode working directory was not preserved: expected ${unicodeCwd}, received ${reportedJobCwd}`);
 	await removeJob(cwdJob);
 
 	let missingCwdError = "";
